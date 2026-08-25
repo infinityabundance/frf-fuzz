@@ -1,0 +1,10 @@
+[package]
+name = "lto_spike"
+version = "0.0.0"
+edition = "2021"
+
+# The hazard being tested: a workspace/user profile forcing LTO.
+[profile.release]
+lto = true
+
+[workspace]

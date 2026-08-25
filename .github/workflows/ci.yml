@@ -1,0 +1,99 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The pinned nightly for instrumented-build verification.
+  NIGHTLY: nightly-2026-04-21
+
+jobs:
+  msrv:
+    name: MSRV (1.85) + feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (default features)
+        run: cargo +1.85.0 build
+      - name: Test (default features)
+        run: cargo +1.85.0 test
+      - name: Build + test (target-runtime only)
+        run: cargo +1.85.0 test --no-default-features --features target-runtime
+      - name: Clippy (all targets, all features)
+        run: cargo +1.85.0 clippy --all-targets --all-features -- -D warnings
+
+  stable:
+    name: Stable (latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build + test
+        run: cargo test --all-features
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Format check
+        run: cargo fmt --check
+
+  instrumentation:
+    name: Nightly instrumentation spike
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify nightly identity
+        run: |
+          rustc +${{ env.NIGHTLY }} -vV | grep 'LLVM version: 22.1.2'
+          rustc +${{ env.NIGHTLY }} -vV | grep '66da6cae1a6f12e9585493ab8f8f19cf753091fd'
+      - name: Run the nightly instrumentation spike
+        run: sh scripts/nightly_spike.sh ${{ env.NIGHTLY }}
+
+  golden-demo:
+    name: End-to-end golden demo (instrumented fuzzing)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the coordinator
+        run: cargo +${{ env.NIGHTLY }} build --all-features
+      - name: Run the golden demonstration (build -> fuzz -> crash -> replay -> fsck -> tmin)
+        run: sh scripts/golden_demo.sh ${{ env.NIGHTLY }}
+      - name: End-to-end CLI smoke (init/add/build/run in a scratch project)
+        run: sh scripts/cli_smoke.sh ${{ env.NIGHTLY }}
+
+  unsafe-audit:
+    name: Unsafe audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run unsafe audit
+        run: sh scripts/unsafe_audit.sh
+
+  doctor:
+    name: Doctor smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Build + doctor --json
+        run: |
+          cargo build
+          cargo run --quiet -- doctor --json | python3 -m json.tool > /dev/null
+          cargo run --quiet -- version
