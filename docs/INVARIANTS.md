@@ -166,9 +166,13 @@ enforced by `#![deny(unsafe_code)]` at the crate root with narrow
    pointer registration/scanning and the raw ring (the only allocation-free
    way to get mutable callback storage; the callback path is additionally
    written icmp-free and loop-free — see `COMPATIBILITY.md` for why).
-2. `simd/mod.rs` and `simd/x86_avx2.rs` — AVX2 runtime dispatch and
-   intrinsics.
+2. `target_runtime/worker.rs` — the libc FFI boundary (memory limits,
+   `setitimer`; declared locally because libc does not export it for
+   linux-gnu).
 3. `execute/crash_ledger.rs` — the `memmap2` syscall boundary.
+4. `execute/coordinator.rs` — the SIGINT handler (async-signal-safe store).
+5. `simd/mod.rs` and `simd/x86_avx2.rs` — AVX2 runtime dispatch and
+   intrinsics.
 
 Every unsafe block carries a `// SAFETY:` comment stating the exact
 invariant. `#![deny(unsafe_op_in_unsafe_fn)]` is enabled crate-wide.
@@ -184,3 +188,16 @@ the approved modules.
   integer/fixed-point/bucket fields).
 * `f64` may appear in DSFB-Debug's own outputs; frf-fuzz derives its
   integer identity from enums/masks, not from DSFB's floats.
+* Lineage/regime/morphology derivation is deterministic given the durable
+  corpus: `CorpusMeta` records each entry's observed signals, edge mutator,
+  morphology ID, and admission sequence; the coordinator replays edges in
+  admission order on rebuild and verifies the re-derived morphology ID
+  against the stored one (a mismatch is corruption, I13). Closed regime
+  episodes re-derive identically (content-addressed re-writes are
+  idempotent).
+* `value_bucket` and `magnitude_bucket` are declared normalization laws
+  (documented beside the code); the raw values always travel with the
+  observation, so bucketing never hides evidence.
+* The regime EMA is integer fixed-point in 2^shift units: a raw-unit floor
+  EMA gets stuck below 2^shift and recovery never fires (Phase-2 finding,
+  locked by the noise/drift/recovery test vectors).

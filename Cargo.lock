@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "frf-fuzz"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "dsfb-database",

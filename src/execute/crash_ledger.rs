@@ -139,7 +139,7 @@ impl CrashLedgerWriter {
 
     /// Commit the exact candidate bytes into the ledger's input-echo
     /// region. Called immediately after [`Self::commit`] and immediately
-    /// before execution. Refuses inputs above [`MAX_ECHO_LEN`] (a bounded
+    /// before execution. Refuses inputs above the echo bound (a bounded
     /// mutation engine cannot produce them, but the check is free).
     pub fn commit_echo(&mut self, input: &[u8]) -> Result<()> {
         if input.len() > MAX_ECHO_LEN {

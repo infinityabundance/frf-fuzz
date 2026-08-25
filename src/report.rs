@@ -45,8 +45,20 @@ pub struct Report {
     pub corpus_entries: usize,
     /// Distinct coverage features covered by the corpus.
     pub corpus_features: usize,
+    /// Distinct (signal, value-bucket) state features (Phase 2).
+    pub state_features: usize,
     /// All findings (deterministic order).
     pub findings: Vec<FindingInfo>,
+    /// Run tapes written.
+    pub tapes: u64,
+    /// Morphology signatures written.
+    pub morphologies: u64,
+    /// Boundary witnesses written.
+    pub boundaries: u64,
+    /// Closed regime episodes written.
+    pub regime_episodes: u64,
+    /// Signal schema objects.
+    pub signal_schemas: u64,
     /// Refs (name -> id hex), sorted.
     pub refs: Vec<(String, String)>,
     /// Per-family object counts.
@@ -97,6 +109,11 @@ pub fn generate(store_root: &std::path::Path) -> Result<Report> {
                     });
                 }
             }
+            Family::RunTape => report.tapes += 1,
+            Family::MorphologySignature => report.morphologies += 1,
+            Family::BoundaryWitness => report.boundaries += 1,
+            Family::RegimeEpisode => report.regime_episodes += 1,
+            Family::SignalSchema => report.signal_schemas += 1,
             _ => {}
         }
     }
@@ -107,8 +124,20 @@ pub fn generate(store_root: &std::path::Path) -> Result<Report> {
     let index = CorpusIndex::rebuild(&store)?;
     report.corpus_entries = index.len();
     report.corpus_features = index.feature_count();
+    report.state_features = count_state_features(&index);
 
     Ok(report)
+}
+
+/// Count the distinct (signal, value-bucket) state features in the corpus.
+fn count_state_features(index: &CorpusIndex) -> usize {
+    let mut set = std::collections::BTreeSet::new();
+    for (_, meta) in index.iter() {
+        for (s, b) in crate::observe::sketch::state_buckets(&meta.signals) {
+            set.insert((s, b));
+        }
+    }
+    set.len()
 }
 
 /// Human-readable rendering.
@@ -124,6 +153,12 @@ pub fn render_human(r: &Report) -> String {
         "distinct coverage features: {}\n",
         r.corpus_features
     ));
+    s.push_str(&format!("distinct state features: {}\n", r.state_features));
+    s.push_str(&format!("run tapes: {}\n", r.tapes));
+    s.push_str(&format!("morphologies: {}\n", r.morphologies));
+    s.push_str(&format!("boundary witnesses: {}\n", r.boundaries));
+    s.push_str(&format!("regime episodes: {}\n", r.regime_episodes));
+    s.push_str(&format!("signal schemas: {}\n", r.signal_schemas));
     s.push_str(&format!("findings: {}\n", r.findings.len()));
     for f in &r.findings {
         s.push_str(&format!(
@@ -159,8 +194,8 @@ pub fn render_json(r: &Report) -> String {
             .unwrap_or_else(|| "null".to_string())
     ));
     s.push_str(&format!(
-        "\"corpus_entries\":{},\"corpus_features\":{},\"findings\":[",
-        r.corpus_entries, r.corpus_features
+        "\"corpus_entries\":{},\"corpus_features\":{},\"state_features\":{},\"tapes\":{},\"morphologies\":{},\"boundaries\":{},\"regime_episodes\":{},\"signal_schemas\":{},\"findings\":[",
+        r.corpus_entries, r.corpus_features, r.state_features, r.tapes, r.morphologies, r.boundaries, r.regime_episodes, r.signal_schemas
     ));
     for (i, f) in r.findings.iter().enumerate() {
         if i > 0 {
@@ -233,6 +268,18 @@ pub fn corpus_link_check(store_root: &std::path::Path) -> Result<Vec<String>> {
                     errors.push(format!(
                         "{id}: parent {} is missing or not a corpus entry",
                         parent
+                    ));
+                }
+            }
+        }
+        // Morphology link (when present) must resolve to a morphology object.
+        if let Some(m) = meta.morphology_id {
+            match store.get_typed(&m) {
+                Ok(Some((Family::MorphologySignature, _))) => {}
+                _ => {
+                    errors.push(format!(
+                        "{id}: morphology {} is missing or not a morphology-signature",
+                        m
                     ));
                 }
             }

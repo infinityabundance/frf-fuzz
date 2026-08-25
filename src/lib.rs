@@ -71,7 +71,19 @@ pub mod corpus;
 pub mod id;
 
 #[cfg(feature = "coordinator")]
+pub mod observe;
+
+#[cfg(feature = "coordinator")]
+pub mod dsfb;
+
+#[cfg(feature = "coordinator")]
 pub mod store;
+
+#[cfg(feature = "coordinator")]
+pub mod boundary;
+
+#[cfg(feature = "coordinator")]
+pub mod tape;
 
 #[cfg(feature = "coordinator")]
 pub mod report;

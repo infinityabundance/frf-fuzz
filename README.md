@@ -11,11 +11,16 @@ FRF determines whether promoted discoveries are evidence.
 Gemel remembers what those discoveries meant across software evolution.
 ```
 
-Status: **Phases 0 and 1 complete** — a usable, deterministic, coverage +
-compare-guided Rust fuzzer with persistent instrumented workers, a
+Status: **Phases 0-2 complete** — a usable, deterministic fuzzer with
+coverage + compare guidance AND residual-guided fuzzing: target-defined
+semantic signals, mutation residuals, regime episodes (Stable → Drift →
+InEpisode → Recovering with deterministic close), inspectable morphology
+signatures with a Structured-Unknown discipline, EXPLORE/AMPLIFY
+scheduling, counterfactual boundary witnesses with two-sided minimization,
+and deterministic run tapes. Persistent instrumented workers, a
 content-addressed corpus, crash recovery without per-execution IPC, and the
-full `init/add/build/run/replay/tmin/cmin/inspect/report/fsck` surface. See
-`docs/ROADMAP.md` for the phase plan.
+`init/add/build/run/replay/tmin/cmin/boundary/inspect/report/fsck` surface.
+See `docs/ROADMAP.md` for the phase plan.
 
 ## The idea in one paragraph
 
@@ -36,12 +41,16 @@ cargo install frf-fuzz
 cd my-project
 # add the dependency (the fuzz target links only the tiny target-runtime):
 #   [dependencies]
-#   frf-fuzz = { version = "0.1", default-features = false, features = ["target-runtime"] }
+#   frf-fuzz = { version = "0.2", default-features = false, features = ["target-runtime"] }
 
 cargo frf-fuzz init
 cargo frf-fuzz add parser      # creates src/bin/frf_fuzz_parser.rs
 cargo frf-fuzz build parser    # pinned-nightly instrumented build
 cargo frf-fuzz run parser      # spawns N persistent workers and fuzzes
+
+# residual-guided tools:
+cargo frf-fuzz run parser --residual off   # coverage-only ablation
+cargo frf-fuzz boundary <finding-id>       # two-sided minimization
 ```
 
 A generated target is a normal binary in your existing crate:

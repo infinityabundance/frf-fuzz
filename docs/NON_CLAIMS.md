@@ -74,6 +74,10 @@ is wrong.
 * "regime episode E opened at t0, peaked at t1, closed at t2"
 * "the discriminating probe supported / contradicted / left ambiguous the
   precedent"
+* "signal s moved persistently across a batch (drift candidate)"
+* "morphology M is StructuredUnknown (no named class applies)"
+* "boundary witness (left survives, right dies) minimized distance d1 -> d2"
+* "tape replay reproduced / diverged from the recorded observation"
 
 These are falsifiable statements about observations and experiments, not
 judgments about the software's future behavior.

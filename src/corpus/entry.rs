@@ -8,11 +8,21 @@
 //!   pure function of the input, so re-discovering the same input never
 //!   duplicates storage and the input can be looked up by hashing.
 //! * `CorpusMeta` — the durable observation metadata: entry ID, parent,
-//!   generation, the footprint-masked feature set, and the admission
-//!   reason. Features CANNOT be re-derived without re-execution, so this
-//!   metadata is durable; it is what lets the in-memory
-//!   [`CorpusIndex`] be rebuilt by scanning (fsck/campaign start) instead
-//!   of being treated as authoritative.
+//!   generation, the footprint-masked feature set, the recorded signal
+//!   observation, the admission reason, the edge mutator, the morphology
+//!   signature ID, and the admission sequence number. Features/signals
+//!   CANNOT be re-derived without re-execution, so this metadata is durable;
+//!   it is what lets the in-memory corpus index be rebuilt by scanning
+//!   (fsck/campaign start) instead of being treated as authoritative.
+//!
+//! # Version 2 (Phase 2)
+//!
+//! `signals` records the observed signal vector of the input (the
+//! mutation-residual baseline for its children); `mutator_id` records the
+//! edge mutator that produced the entry (lineage identity); `morphology_id`
+//! references the durable morphology signature; `admission_seq` is the
+//! coordinator's admission counter so lineage/regime replay on rebuild is
+//! exactly the recorded processing order.
 //!
 //! The wire encoding below is fixed and bounded; see
 //! [`crate::scheduler::work_order`] for the feature-set representation
@@ -22,9 +32,10 @@
 
 use crate::error::{Error, Result};
 use crate::id::ContentId;
+use crate::target_runtime::signals::SignalVector;
 
 /// Version of the corpus-meta payload encoding.
-pub const CORPUS_META_VERSION: u8 = 1;
+pub const CORPUS_META_VERSION: u8 = 2;
 
 /// Max features recorded per entry (an execution cannot exceed this).
 pub const MAX_FEATURES_PER_ENTRY: usize = 1 << 16;
@@ -41,6 +52,16 @@ pub enum AdmissionReason {
     SmallerRepresentative = 3,
     /// A crashing / timeout input (also stored as a finding).
     Crash = 4,
+    /// A new (signal, value-bucket) state feature appeared (Phase 2).
+    NewStateFeature = 5,
+    /// A new morphology signature appeared and matched a named class
+    /// (Phase 3+; Phase 2 has no named classes yet).
+    NewMorphology = 6,
+    /// A new non-trivial morphology that matches no named class — retained
+    /// as a first-class Structured-Unknown trajectory (I6).
+    StructuredUnknown = 7,
+    /// A counterfactual boundary pair (regime-A/regime-B) was retained.
+    BoundaryWitness = 8,
 }
 
 impl AdmissionReason {
@@ -51,6 +72,10 @@ impl AdmissionReason {
             2 => Some(AdmissionReason::NewCoverage),
             3 => Some(AdmissionReason::SmallerRepresentative),
             4 => Some(AdmissionReason::Crash),
+            5 => Some(AdmissionReason::NewStateFeature),
+            6 => Some(AdmissionReason::NewMorphology),
+            7 => Some(AdmissionReason::StructuredUnknown),
+            8 => Some(AdmissionReason::BoundaryWitness),
             _ => None,
         }
     }
@@ -67,6 +92,10 @@ impl AdmissionReason {
             AdmissionReason::NewCoverage => "new-coverage",
             AdmissionReason::SmallerRepresentative => "smaller-representative",
             AdmissionReason::Crash => "crash",
+            AdmissionReason::NewStateFeature => "new-state-feature",
+            AdmissionReason::NewMorphology => "new-morphology",
+            AdmissionReason::StructuredUnknown => "structured-unknown",
+            AdmissionReason::BoundaryWitness => "boundary-witness",
         }
     }
 }
@@ -84,6 +113,18 @@ pub struct CorpusMeta {
     pub features: Vec<u64>,
     /// Admission reason.
     pub reason: AdmissionReason,
+    /// The recorded signal observation of this input (Phase 2; the
+    /// mutation-residual baseline for its children).
+    pub signals: SignalVector,
+    /// The mutator family that produced this entry from its parent (None
+    /// for seeds). Lineage identity (Phase 2).
+    pub mutator_id: Option<u16>,
+    /// The durable morphology signature of this entry's lineage position
+    /// (None when the entry is a trivial baseline). Phase 2.
+    pub morphology_id: Option<ContentId>,
+    /// The coordinator's admission sequence number (rebuild/regime replay
+    /// order). Phase 2.
+    pub admission_seq: u64,
 }
 
 /// Encode corpus metadata to its canonical payload.
@@ -95,7 +136,9 @@ pub fn encode_meta(meta: &CorpusMeta) -> Result<Vec<u8>> {
             got: meta.features.len() as u64,
         });
     }
-    let mut out = Vec::with_capacity(1 + 32 + 32 + 4 + 1 + 4 + meta.features.len() * 8);
+    let mut out = Vec::with_capacity(
+        1 + 32 + 32 + 4 + 1 + 4 + meta.features.len() * 8 + 8 + 520 + 1 + 1 + 32 + 8,
+    );
     out.push(CORPUS_META_VERSION);
     out.extend_from_slice(meta.entry_id.as_bytes());
     match meta.parent_id {
@@ -108,6 +151,25 @@ pub fn encode_meta(meta: &CorpusMeta) -> Result<Vec<u8>> {
     for f in &meta.features {
         out.extend_from_slice(&f.to_le_bytes());
     }
+    // Signal vector: touched mask + 64 × u64 (fixed 520 B).
+    out.extend_from_slice(&meta.signals.touched_mask().to_le_bytes());
+    for i in 0..crate::target_runtime::signals::MAX_SIGNALS {
+        out.extend_from_slice(
+            &meta
+                .signals
+                .value(crate::target_runtime::signals::SignalId(i as u16))
+                .to_le_bytes(),
+        );
+    }
+    match meta.mutator_id {
+        Some(m) => out.extend_from_slice(&m.to_le_bytes()),
+        None => out.extend_from_slice(&0u16.to_le_bytes()),
+    }
+    match meta.morphology_id {
+        Some(id) => out.extend_from_slice(id.as_bytes()),
+        None => out.extend_from_slice(&[0u8; 32]),
+    }
+    out.extend_from_slice(&meta.admission_seq.to_le_bytes());
     Ok(out)
 }
 
@@ -152,6 +214,30 @@ pub fn decode_meta(bytes: &[u8]) -> Result<CorpusMeta> {
     for _ in 0..feature_count {
         features.push(u64::from_le_bytes(take(8)?.try_into().unwrap()));
     }
+    // Signal vector (fixed 520 B).
+    let touched = u64::from_le_bytes(take(8)?.try_into().unwrap());
+    let mut signals = SignalVector::new();
+    for i in 0..crate::target_runtime::signals::MAX_SIGNALS {
+        let v = u64::from_le_bytes(take(8)?.try_into().unwrap());
+        if touched & (1u64 << i) != 0 {
+            signals
+                .observe(crate::target_runtime::signals::SignalId(i as u16), v)
+                .map_err(|_| Error::Encoding("signal id out of range"))?;
+        }
+    }
+    let mutator_raw = u16::from_le_bytes(take(2)?.try_into().unwrap());
+    let mutator_id = if mutator_raw == 0 {
+        None
+    } else {
+        Some(mutator_raw)
+    };
+    let morph_raw = take(32)?;
+    let morphology_id = if morph_raw.iter().all(|b| *b == 0) {
+        None
+    } else {
+        Some(ContentId::from_array(morph_raw.try_into().unwrap()))
+    };
+    let admission_seq = u64::from_le_bytes(take(8)?.try_into().unwrap());
     if pos != bytes.len() {
         return Err(Error::Encoding("corpus-meta has trailing bytes"));
     }
@@ -161,6 +247,10 @@ pub fn decode_meta(bytes: &[u8]) -> Result<CorpusMeta> {
         generation,
         features,
         reason,
+        signals,
+        mutator_id,
+        morphology_id,
+        admission_seq,
     })
 }
 
@@ -169,12 +259,20 @@ mod tests {
     use super::*;
 
     fn sample_meta() -> CorpusMeta {
+        let mut signals = SignalVector::new();
+        signals
+            .observe(crate::target_runtime::signals::SignalId(0), 42)
+            .unwrap();
         CorpusMeta {
             entry_id: ContentId::new(b"input bytes"),
             parent_id: Some(ContentId::new(b"parent")),
             generation: 3,
             features: vec![1, 2, 0xFFFF_FFFF_0000_0000],
             reason: AdmissionReason::NewCoverage,
+            signals,
+            mutator_id: Some(7),
+            morphology_id: Some(ContentId::new(b"morph")),
+            admission_seq: 99,
         }
     }
 
@@ -193,11 +291,16 @@ mod tests {
             generation: 0,
             features: vec![],
             reason: AdmissionReason::Seed,
+            mutator_id: None,
+            morphology_id: None,
+            admission_seq: 0,
             ..sample_meta()
         };
         let dec = decode_meta(&encode_meta(&m).unwrap()).unwrap();
         assert_eq!(dec, m);
         assert_eq!(dec.parent_id, None);
+        assert_eq!(dec.mutator_id, None);
+        assert_eq!(dec.morphology_id, None);
     }
 
     #[test]
@@ -225,6 +328,10 @@ mod tests {
         assert_eq!(AdmissionReason::NewCoverage.code(), 2);
         assert_eq!(AdmissionReason::SmallerRepresentative.code(), 3);
         assert_eq!(AdmissionReason::Crash.code(), 4);
+        assert_eq!(AdmissionReason::NewStateFeature.code(), 5);
+        assert_eq!(AdmissionReason::NewMorphology.code(), 6);
+        assert_eq!(AdmissionReason::StructuredUnknown.code(), 7);
+        assert_eq!(AdmissionReason::BoundaryWitness.code(), 8);
         assert_eq!(AdmissionReason::from_byte(1), Some(AdmissionReason::Seed));
         assert_eq!(AdmissionReason::from_byte(9), None);
     }

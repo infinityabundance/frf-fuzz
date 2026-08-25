@@ -78,11 +78,14 @@ pub enum Family {
     /// durable, non-rebuildable observation metadata (features cannot be
     /// re-derived without re-execution).
     CorpusMeta = 0x0B,
+    /// The target's registered signal schema (name/unit per signal ID).
+    /// Content-addressed: identical schemas share one object.
+    SignalSchema = 0x0C,
 }
 
 impl Family {
     /// All defined families.
-    pub const ALL: [Family; 11] = [
+    pub const ALL: [Family; 12] = [
         Family::CorpusEntry,
         Family::Finding,
         Family::RunTape,
@@ -94,6 +97,7 @@ impl Family {
         Family::RegimeEpisode,
         Family::Config,
         Family::CorpusMeta,
+        Family::SignalSchema,
     ];
 
     /// The one-byte family code.
@@ -120,6 +124,7 @@ impl Family {
             Family::RegimeEpisode => "regime-episode",
             Family::Config => "config",
             Family::CorpusMeta => "corpus-meta",
+            Family::SignalSchema => "signal-schema",
         }
     }
 }

@@ -27,7 +27,11 @@ use crate::target_runtime::FuzzContext;
 
 /// The type of the target execute hook.
 pub type ExecuteFn = fn(&[u8], &mut FuzzContext) -> Result<()>;
-/// The type of the optional setup/teardown hooks.
+/// The type of the optional setup hook: receives the context so the target
+/// can register its signal schema (`cx.register_signal(...)`) once, before
+/// the loop (Phase 2; strings never flow through the per-execution path).
+pub type SetupFn = Option<fn(&mut FuzzContext) -> Result<()>>;
+/// The type of the optional teardown hook.
 pub type OptionalHook = Option<fn() -> Result<()>>;
 /// The type of the optional per-execution reset hook.
 pub type ResetFn = Option<fn(&mut FuzzContext) -> Result<()>>;
@@ -35,8 +39,9 @@ pub type ResetFn = Option<fn(&mut FuzzContext) -> Result<()>>;
 /// The four target hooks. `execute` is mandatory; the rest are optional.
 #[derive(Debug, Clone, Copy)]
 pub struct TargetHooks {
-    /// Runs once before the worker loop.
-    pub setup: OptionalHook,
+    /// Runs once before the worker loop (with the context, so the target
+    /// can register its signal schema).
+    pub setup: SetupFn,
     /// The per-execution target function.
     pub execute: ExecuteFn,
     /// Optional per-execution state reset (before `execute`).
@@ -50,7 +55,7 @@ pub struct TargetHooks {
 /// is a macro-level programming error, refused).
 #[derive(Debug, Default)]
 pub struct HooksBuilder {
-    setup: OptionalHook,
+    setup: SetupFn,
     execute: Option<ExecuteFn>,
     reset: ResetFn,
     teardown: OptionalHook,
@@ -62,8 +67,9 @@ impl HooksBuilder {
         HooksBuilder::default()
     }
 
-    /// Set the setup hook (once, before the loop).
-    pub fn setup(mut self, f: fn() -> Result<()>) -> HooksBuilder {
+    /// Set the setup hook (once, before the loop). The hook receives the
+    /// context so the target can register its signal schema.
+    pub fn setup(mut self, f: fn(&mut FuzzContext) -> Result<()>) -> HooksBuilder {
         assert!(self.setup.is_none(), "fuzz_target!: setup registered twice");
         self.setup = Some(f);
         self

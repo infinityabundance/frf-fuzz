@@ -13,7 +13,9 @@
 //!                             by the reset below)
 //! clear coverage counters
 //! reset cmp ring
+//! cx.reset()                 (clear the signal vector; NOT execution_ordinal)
 //! (reset hook, then execute hook)
+//! capture signal vector      (a fixed-size memcpy; constant edges)
 //! snapshot cmp ring          (captures exactly the target's events: the
 //!                             scan has not run yet — no tail truncation)
 //! scan coverage counters     (its own cmp events land after the captured
@@ -24,6 +26,17 @@
 //! calibration and permanently masked. The snapshot-before-scan ordering
 //! removes the "calibrated cmp tail" problem entirely: the captured range
 //! contains only target events.
+//!
+//! # Phase 2: residual observation
+//!
+//! Every execution's signal vector is compared against the ORDER's parent
+//! signals (sent by the coordinator) into a fixed-size [`ResidualSketch`].
+//! A per-order [`OrderSignalTracker`] folds sketches into the
+//! persistent-drift rule, and a [`SignalBatchSummary`] aggregates the whole
+//! batch. The worker pushes a discovery when an execution is interesting:
+//! new local coverage, a newly-touched signal, a persistent same-direction
+//! drift, or a large single delta. The coordinator decides admission; the
+//! worker never writes anything per execution (I1).
 //!
 //! # Crash recovery contract
 //!
@@ -44,11 +57,14 @@ use crate::execute::crash_ledger::CrashLedgerWriter;
 use crate::execute::protocol::{self, MsgKind};
 use crate::mutation::{self, CmpHit, CounterRng, MutationCoordinate, MutationInput, MutatorId};
 use crate::scheduler::work_order::{
-    self, CmpEventWire, DiscoveryRecord, ExecutionStatus, Hello, WorkOrder, WorkResult,
-    MAX_CMP_EVENTS_PER_EXEC, MAX_DISCOVERIES_PER_RESULT,
+    self, CmpEventWire, CmpHitWire, DiscoveryRecord, ExecutionStatus, Hello, WorkOrder, WorkResult,
+    MAX_CMP_EVENTS_PER_EXEC, MAX_CMP_HITS_PER_EXEC, MAX_DISCOVERIES_PER_RESULT,
 };
 use crate::target_runtime::cmp::{self, CmpEvent, CmpKind};
 use crate::target_runtime::sancov;
+use crate::target_runtime::signals::{
+    OrderSignalTracker, ResidualSketch, SignalBatchSummary, SignalVector,
+};
 use crate::target_runtime::target::{self, TargetHooks};
 use crate::target_runtime::FuzzContext;
 use std::collections::BTreeSet;
@@ -74,6 +90,24 @@ pub const ENV_MEMORY_LIMIT_MB: &str = "FRF_FUZZ_MEMORY_LIMIT_MB";
 /// `(parent_short == [0;8], mutator == 0)` as "override execution whose
 /// ordinal is `mutation_index` of the current override session".
 pub const OVERRIDE_MARKER_MUTATOR: u16 = 0;
+
+/// Worker-side persistence rule: an execution is "persistently drifting" on
+/// a signal when at least this many consecutive same-direction nonzero
+/// deltas have accumulated ...
+pub const PERSIST_MIN_RUN: u8 = 4;
+/// ... AND the cumulative magnitude bucket is at least this (|delta| >= 16).
+pub const PERSIST_MIN_CUM_BUCKET: u8 = 4;
+/// A single delta at or above this magnitude bucket (|delta| >= 2^15) is
+/// treated as a potential boundary crossing and pushed on its own.
+pub const LARGE_DELTA_BUCKET: u8 = 16;
+/// Byte budget for one encoded work result. The worker stops pushing
+/// discoveries when the estimated encoded payload would exceed this, so a
+/// discovery flood can never produce a frame that violates the protocol's
+/// 1 MiB bound (a Phase-2 finding: unbounded discovery streams killed
+/// workers with "frame length exceeds bound" and produced false crash
+/// findings). The estimate tracks the dominant per-record fields and stays
+/// well below the 1 MiB frame ceiling.
+pub const RESULT_BYTE_BUDGET: usize = 700 * 1024;
 
 /// The worker main loop. Returns the process exit code.
 pub fn run_main() -> i32 {
@@ -122,13 +156,17 @@ fn run_inner() -> Result<i32> {
         events_buf,
         local_baseline: BTreeSet::new(),
         last_cmp_hits: Vec::new(),
+        tracker: OrderSignalTracker::new(),
+        batch_summary: SignalBatchSummary::new(),
     };
 
-    // ---- setup hook (target init; its edges are wiped by the first
-    // calibration window's clear) ----
+    // ---- setup hook (target init + signal schema registration; its edges
+    // are wiped by the first calibration window's clear) ----
     if let Some(setup) = hooks.setup {
-        setup().map_err(|e| Error::Other(format!("target setup hook failed: {e}")))?;
+        setup(&mut worker.cx)
+            .map_err(|e| Error::Other(format!("target setup hook failed: {e}")))?;
     }
+    let schema_wire = work_order::schema_to_wire(worker.cx.schema())?;
 
     // ---- calibration ----
     // The footprint must cover the FULL window skeleton (clear, reset,
@@ -151,6 +189,7 @@ fn run_inner() -> Result<i32> {
         pid: process::id(),
         rustc_release: rustc_release_line().unwrap_or_else(|| "unknown".into()),
         llvm_version: rustc_llvm_line().unwrap_or_else(|| "unknown".into()),
+        schema: schema_wire,
     };
     let mut out = BufWriter::new(std::io::stdout().lock());
     let mut input = BufReader::new(std::io::stdin().lock());
@@ -322,6 +361,10 @@ struct Worker {
     local_baseline: BTreeSet<u64>,
     /// Cmp hits from the previous window (cmp-guided substitution).
     last_cmp_hits: Vec<CmpHit>,
+    /// Per-order persistent-drift tracker (reset per work order).
+    tracker: OrderSignalTracker,
+    /// Per-order batch signal summary (reset per work order).
+    batch_summary: SignalBatchSummary,
 }
 
 /// One executed window's observation (worker-internal).
@@ -330,8 +373,24 @@ struct WindowOutcome {
     features: Vec<u64>,
     /// Target cmp events (already separated from the scan by ordering).
     events: Vec<CmpEvent>,
+    /// The observed signal vector (Phase 2).
+    signals: SignalVector,
     /// Execution time bucket (logarithmic).
     time_bucket: u8,
+}
+
+/// Why an execution is worth reporting to the coordinator.
+struct InterestFlags(u8);
+
+impl InterestFlags {
+    const NOVEL_FEATURES: u8 = 1 << 0;
+    const NEW_SIGNAL: u8 = 1 << 1;
+    const PERSISTENT: u8 = 1 << 2;
+    const LARGE_DELTA: u8 = 1 << 3;
+
+    fn any(&self) -> bool {
+        self.0 != 0
+    }
 }
 
 impl Worker {
@@ -347,7 +406,11 @@ impl Worker {
         } else {
             Some(order.partner.as_slice())
         };
+        // Fresh per-order residual state.
+        self.tracker = OrderSignalTracker::new();
+        self.batch_summary = SignalBatchSummary::new();
         let mut result = WorkResult::default();
+        let mut result_bytes = 0usize;
         for i in 0..order.index_count {
             let index = order.start_index.wrapping_add(i);
             let coord = MutationCoordinate {
@@ -359,9 +422,20 @@ impl Worker {
                 mutation_index: index,
                 probe_params: [0; 4],
             };
-            let candidate = self.mutate(order, &coord, mutator, &dict_refs, partner)?;
+            let (candidate, hits_used) =
+                self.mutate(order, &coord, mutator, &dict_refs, partner)?;
             result.exec_count += 1;
             let outcome = self.window_execute(&coord, &candidate)?;
+            // Phase 2: residual observation (fixed-size, heap-free). The
+            // exact saturating deltas feed the drift tracker and the batch
+            // summary; the bucketized sketch travels with the discovery.
+            let deltas =
+                crate::target_runtime::signals::deltas(&order.parent_signals, &outcome.signals);
+            let sketch = ResidualSketch::of(&order.parent_signals, &outcome.signals);
+            self.batch_summary.push_deltas(&outcome.signals, &deltas);
+            let persistent =
+                self.tracker
+                    .push(&deltas, &sketch, PERSIST_MIN_RUN, PERSIST_MIN_CUM_BUCKET);
             // Update the local baseline and decide whether this execution
             // is locally novel.
             let novel: Vec<u64> = outcome
@@ -373,14 +447,47 @@ impl Worker {
             for f in &outcome.features {
                 self.local_baseline.insert(*f);
             }
-            if !novel.is_empty() {
-                self.push_discovery(&mut result, coord, outcome)?;
+            let interest = InterestFlags(
+                (if novel.is_empty() {
+                    0
+                } else {
+                    InterestFlags::NOVEL_FEATURES
+                }) | (if sketch.touched_new != 0 {
+                    InterestFlags::NEW_SIGNAL
+                } else {
+                    0
+                }) | (if persistent != 0 {
+                    InterestFlags::PERSISTENT
+                } else {
+                    0
+                }) | (if sketch.at_or_above(LARGE_DELTA_BUCKET) != 0 {
+                    InterestFlags::LARGE_DELTA
+                } else {
+                    0
+                }),
+            );
+            if interest.any() {
+                self.push_discovery(
+                    &mut result,
+                    &mut result_bytes,
+                    coord,
+                    outcome,
+                    sketch,
+                    hits_used,
+                    interest,
+                )?;
             }
         }
+        // Copy the tracker's persistence runs into the summary (the summary
+        // cannot derive them from per-execution sketches alone).
+        for i in 0..crate::target_runtime::signals::MAX_SIGNALS {
+            self.batch_summary.max_run[i] = self.batch_summary.max_run[i].max(self.tracker.run[i]);
+        }
+        result.signal_summary = self.batch_summary;
         Ok(result)
     }
 
-    /// Execute the exact bytes of an input-override order (replay/tmin
+    /// Execute the exact bytes of an input-override order (seed/replay/tmin
     /// sessions). Status is always Ok from a live worker; a crash kills
     /// the process and the coordinator resolves it via the ledger's
     /// override marker (mutator 0, ordinal in `mutation_index`). Override
@@ -402,11 +509,15 @@ impl Worker {
             timeout_count: 0,
             discoveries: Vec::new(),
             truncated: false,
+            signal_summary: SignalBatchSummary::new(),
             override_features: outcome.features,
+            override_signals: outcome.signals,
         })
     }
 
-    /// Deterministically mutate `parent` at `coord` (I2).
+    /// Deterministically mutate `parent` at `coord` (I2). Returns the
+    /// candidate bytes and the compare hits the mutation actually consumed
+    /// (so the coordinator can reconstruct family-15 candidates bit-exactly).
     fn mutate<'a>(
         &'a mut self,
         order: &'a WorkOrder,
@@ -414,7 +525,7 @@ impl Worker {
         mutator: MutatorId,
         dictionary: &'a [&'a [u8]],
         partner: Option<&'a [u8]>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Vec<CmpHitWire>)> {
         let mut rng = CounterRng::from_coordinate_fields(
             coord.campaign_seed,
             coord.generation,
@@ -430,14 +541,23 @@ impl Worker {
             splice_partner: partner,
             influence: None,
         };
+        let hits_used: Vec<CmpHitWire> = self
+            .last_cmp_hits
+            .iter()
+            .take(MAX_CMP_HITS_PER_EXEC)
+            .map(|h| CmpHitWire {
+                width: h.width() as u8,
+                value: h.value(),
+            })
+            .collect();
         let out = mutation::apply(mutator, &mut input)?;
         if out.changed {
-            Ok(out.bytes)
+            Ok((out.bytes, hits_used))
         } else {
             // Deterministic no-op (e.g. empty parent with a delete
             // mutator): still counts as an execution but with the parent
             // bytes unchanged.
-            Ok(order.parent.clone())
+            Ok((order.parent.clone(), hits_used))
         }
     }
 
@@ -473,6 +593,10 @@ impl Worker {
         sancov::clear_all();
         cmp::reset();
         let t0 = SystemTime::now();
+        // Clear the per-execution signal vector (NOT execution_ordinal or
+        // the schema) BEFORE the target's reset hook, so a target that
+        // observes in its reset hook starts from a fresh vector.
+        self.cx.reset();
         if let Some(reset) = self.hooks.reset {
             reset(&mut self.cx)
                 .map_err(|e| Error::Other(format!("target reset hook failed: {e}")))?;
@@ -480,6 +604,9 @@ impl Worker {
         self.cx.execution_ordinal = self.cx.execution_ordinal.wrapping_add(1);
         exec(data, &mut self.cx)
             .map_err(|e| Error::Other(format!("target execute hook failed: {e}")))?;
+        // Capture the signal vector: a fixed-size memcpy with constant
+        // edges, so it cannot contaminate the observation.
+        let signals = self.cx.take_signals();
         let dt_ms = t0.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
         // 4. Snapshot the ring BEFORE the scan: the captured range is
         //    exactly the target's events (the scan's own events land after
@@ -509,6 +636,7 @@ impl Worker {
         Ok(WindowOutcome {
             features,
             events,
+            signals,
             time_bucket: time_bucket(dt_ms),
         })
     }
@@ -548,21 +676,52 @@ impl Worker {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_discovery(
         &mut self,
         result: &mut WorkResult,
+        result_bytes: &mut usize,
         coord: MutationCoordinate,
         outcome: WindowOutcome,
+        sketch: ResidualSketch,
+        hits_used: Vec<CmpHitWire>,
+        interest: InterestFlags,
     ) -> Result<()> {
+        let _ = interest;
         if result.discoveries.len() >= MAX_DISCOVERIES_PER_RESULT {
             result.truncated = true;
             return Ok(());
         }
+        // Byte budget: stop pushing once the encoded result would approach
+        // the protocol frame bound (the count cap alone is not enough for
+        // discovery floods — a Phase-2 finding: an unbounded stream killed
+        // workers with "frame length exceeds bound" and produced false
+        // crash findings). The estimate mirrors the encode sizes of the
+        // dominant fields; the real encode enforces the hard frame bound.
+        let estimate = 49
+            + 1
+            + 4
+            + outcome.features.len() * 8
+            + 2
+            + outcome.events.len().min(MAX_CMP_EVENTS_PER_EXEC) * 17
+            + 2
+            + hits_used.len() * 9
+            + 520
+            + 96
+            + 1;
+        if result_bytes.saturating_add(estimate) > RESULT_BYTE_BUDGET {
+            result.truncated = true;
+            return Ok(());
+        }
+        *result_bytes += estimate;
         result.discoveries.push(DiscoveryRecord {
             coordinate: coord,
             status: ExecutionStatus::Ok,
             features: outcome.features,
             cmp_events: wire_events(&outcome.events),
+            cmp_hits_used: hits_used,
+            signals: outcome.signals,
+            sketch,
             time_bucket: outcome.time_bucket,
         });
         Ok(())

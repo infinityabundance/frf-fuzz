@@ -32,4 +32,4 @@ pub mod signals;
 pub mod target;
 pub mod worker;
 
-pub use signals::FuzzContext;
+pub use signals::{FuzzContext, SignalId};

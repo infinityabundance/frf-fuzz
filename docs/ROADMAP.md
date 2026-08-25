@@ -54,13 +54,65 @@ Deliverables, all verified:
 Measured on the golden-demo target (8 workers, 15 s): ~1.3M executions,
 ~88k exec/s aggregate, 40/40 findings reproduced on replay, tmin 12 -> 8 B.
 
-## Phase 2 — Residual-Guided Fuzzing
+## Phase 2 — Residual-Guided Fuzzing (DONE)
 
-- Target-defined signals (registry + schema), MutationResidual, cheap
-  residual sketch, RegimeObserver (DSFB-Database lesson, documented
-  independently), morphology signatures (inspectable fields, not just hashes),
-  Structured+Unknown plumbing, EXPLORE/AMPLIFY queues, counterfactual
-  boundary witnesses, RunTape + replay.
+- Target-defined signals: fixed-size `SignalVector` (64 u64 + touched mask),
+  schema registration via the setup hook (`cx.register_signal(name, unit)`),
+  HELLO carriage, durable `Family::SignalSchema` objects, `--residual on|off`
+  ablation switch.
+- Worker-side observation: per-execution signal capture in the measurement
+  window, `ResidualSketch` (bucketized child-vs-parent comparison), the
+  per-order `OrderSignalTracker` (persistence run + cumulative magnitude),
+  the `SignalBatchSummary` (the full observation stream in bounded aggregate
+  form), and the interest filter (novel features / touched-new / persistent /
+  large delta) with a per-result byte budget so discovery floods can never
+  overflow the 1 MiB protocol frame (a Phase-2 finding: unbounded discovery
+  streams killed workers and produced false crash findings).
+- `observe/` (coordinator): `MutationResidual` and `TemporalResidual`
+  (separately typed; Authority/Revision arrive with FRF/Gemel in Phase 4),
+  `ExecutionObservation`, signal-schema objects, batch-drift detection.
+- `dsfb/regime.rs`: `RegimeObserver` — instantaneous + integer fixed-point
+  EMA + `Stable -> Drift -> InEpisode -> Recovering` + dwell + deterministic
+  episode close (recovery dwell / max dwell), durable `RegimeEpisode`
+  objects, deviation-baseline reset at close (second episodes open).
+  Semantics documented independently of SQL (I7).
+- `dsfb/morphology.rs`: inspectable `MorphologySignature` (axis mask,
+  directions, magnitude/slew/persistence bins, coactivation, comparison-
+  convergence, state-change, replay stability, structured-Unknown, depth),
+  the `LineageAccumulator`, and the `Trivial`/`StructuredUnknown` classifier
+  (I6: structured trajectories stay Unknown — the FuzzSemanticBank is Phase
+  3). Admission novelty is the structural identity (magnitude/persistence
+  bins excluded — a drift trajectory must not flood the corpus; measured
+  ~3300 admissions in 12s before the fix).
+- Scheduler: EXPLORE/AMPLIFY weighted round-robin (deterministic), the
+  bounded amplify queue fed by batch-drift detection, frontier re-anchoring
+  with a freshness boost, termination on finding.
+- `CorpusMeta` v2: recorded signals, edge mutator, morphology ID, admission
+  sequence — lineage/regime/morphology derivation replays deterministically
+  on rebuild and verifies stored morphology IDs (I13).
+- Counterfactual boundary witnesses: `boundary/witness.rs` (durable pairs,
+  relations, verification status) + `minimize.rs` (deterministic two-sided
+  minimization) + `frf-fuzz boundary <finding-id>`.
+- Run tapes: `tape/model.rs` (build/env digests, candidate, coordinate,
+  observation, termination, lineage) written at durable boundaries (seeds,
+  findings, residual admissions, boundary pairs); `tape/replay.rs` checks the
+  live observation against the recorded one and PRESERVES divergence (I10).
+- Golden demonstration: Path B (marker-depth signal drift to a planted
+  crash with no new coverage) + the coverage-only negative control + the
+  cmp-driven magic gate + boundary minimization, in one command
+  (`scripts/golden_demo.sh`). Acceptance items 7-9, 13 verified.
+
+Measured on the golden-demo target (8 workers, 15 s): residual-on retains
+~33 state features, forms open regime trajectories, dispatches ~120 amplify
+orders and reaches the depth crash; coverage-only shows no depth signal and
+cannot reach it within the same budget (negative control holds).
+
+Phase-2 findings locked by tests: the integer EMA floor (recovery never
+fires below 2^shift), the morphology admission flood, the worker frame
+overflow, the demo cmp-ring flood drowning the magic gate's const-cmp (fixed
+with a branchless marker-count lookup table), and the family-15
+reconstruction determinism gap (the discovery now carries the exact compare
+hits the mutation consumed).
 
 ## Phase 3 — DSFB Endoduction
 

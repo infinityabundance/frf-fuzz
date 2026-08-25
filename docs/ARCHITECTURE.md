@@ -243,58 +243,110 @@ confined to the approved zones (see `INVARIANTS.md`).
 
 ## 11. Observation frame and residuals
 
-`ExecutionObservation` (Phase 2) is compact and fixed-size: ordinal, parent
-short key, mutation coordinate, outcome, time bucket, coverage novelty count,
-coverage digest, compare summary, signal vector, residual sketch, state
-sketch, status flags. Four residual families, separately typed, never
-flattened into one score:
+`ExecutionObservation` (Phase 2, `observe/frame.rs`) is compact and
+fixed-size: coordinate, outcome, feature set, compare summary, compare hits
+used (family-15 exact reconstruction), signal vector, residual sketch, time
+bucket. The hot representation is bounded and heap-free on the worker side
+(the `SignalVector` + `ResidualSketch` are fixed-size arrays).
 
-* Authority residual `R_A(candidate, input)` — FRF/reference authority.
-* Mutation residual `R_M(child, parent)` — what a mutation changed.
-* Revision residual `R_V(Vn, Vn-1, tape)` — Gemel history replay.
-* Temporal/campaign residual `R_T(k)` — drift/slew/regime.
+The four residual families are separately typed and never flattened into one
+score. Phase 2 implements the two that exist in Phase 2:
+
+* Mutation residual `R_M(child, parent)` — `observe/residual.rs::
+  MutationResidual`: exact saturating per-signal deltas of a corpus edge, the
+  child-vs-parent residual sketch, and the touched-new/lost masks. Computed
+  from the parent's RECORDED observation (carried in the work order), so
+  residuals are lineage-consistent.
+* Temporal residual `R_T(k)` — `TemporalResidual`: observation vs the
+  lineage nominal + instantaneous delta; feeds the regime observer.
+
+Authority residual (FRF, Phase 4) and revision residual (Gemel, Phase 4) are
+NOT stubbed; they arrive with their bridges (docs/ROADMAP.md).
+
+The cheap Level-0 sketch (`target_runtime/signals.rs::ResidualSketch`) is
+computed in the worker per execution against the order's parent signals:
+per-signal magnitude buckets, 2-bit directions, touched-new/lost masks — all
+fixed-size, heap-free, deterministic. The worker folds sketches into a
+per-order `OrderSignalTracker` (consecutive same-direction runs + cumulative
+magnitude) and a `SignalBatchSummary` (the full observation stream in
+bounded aggregate form — how the coordinator sees rejected executions
+without per-execution IPC).
 
 ## 12. DSFB integration
 
-* **DSFB-Debug** (`dsfb-debug 0.1.0`, `default-features=false, features=
-  ["std"]`, zero transitive deps) is the structural substrate: residual, sign
-  tuple, drift, slew, grammar, hysteresis, DSA, policy, episodes, the 205-
-  detector fusion field. frf-fuzz runs the cheap structural path at Level 0/1
-  and the full detector field only on promoted executions, and implements its
-  own `FuzzSemanticBank` (Phase 3) — DSFB's production-debugging motif names
-  are never applied to fuzz behavior. **Structured+Unknown is a valid,
-  first-class result**; nearest-label classification is forbidden (I6).
-  The verified call sequences are in `DESIGN-DSFB.md` (see the forensic
-  report `REPORT-dsfb-debug-0.1.0.md` in `.phase0/forensics/`).
-* **DSFB-Database** is an architectural lesson, not an ontology: the generic
-  `RegimeObserver` (Phase 2) reimplements instantaneous residual + EMA +
-  Stable/InEpisode/Recovering + dwell + deterministic episode close, documented
-  independently from SQL. The real `dsfb-database` crate (feature `database`,
-  `default-features=false`) is used only for real database telemetry targets;
-  generic fuzz residuals can never be coerced into its `ResidualClass` — that
-  refusal is type-level (no conversion exists) (I7).
+The `dsfb/` module takes the architectural lessons and reimplements them
+locally, with semantics documented independently of SQL (I7):
+
+* `dsfb/regime.rs::RegimeObserver` — the DSFB-Database lesson: instantaneous
+  residual + integer fixed-point EMA (2^shift units; a raw-unit floor EMA
+  gets stuck below 2^shift and recovery never fires — a Phase-2 finding) +
+  `Stable -> Drift -> InEpisode -> Recovering` + dwell counts + a
+  deterministic episode close (recovery dwell or max-dwell cap — never
+  wall-clock). Episodes reset their deviation baseline at close so a later
+  regime opens its own bounded episode. Closed episodes are durable
+  `Family::RegimeEpisode` objects. The real `dsfb-database` crate (feature
+  `database`) is used only for real database telemetry targets (Phase 6);
+  generic fuzz residuals can never be coerced into its `ResidualClass` —
+  no conversion exists (I7).
+* `dsfb/morphology.rs::MorphologySignature` — an inspectable deterministic
+  shape (axis mask, direction bits, magnitude/slew/persistence bins,
+  coactivation, comparison-convergence class, state-change class, replay
+  stability, structured-Unknown marker, depth). The canonical encoding is
+  hashed for the ID, but every field is retained. `LineageAccumulator`
+  derives successive signatures from a lineage's edge residuals; replaying
+  the same edges yields identical signatures (I12 spirit). The classifier
+  distinguishes `Trivial` from `StructuredUnknown`; Phase 2 has no named
+  fuzz motifs (the FuzzSemanticBank is Phase 3), so every structured
+  signature is `StructuredUnknown` — it is NEVER renamed to a nearest label
+  (I6). **Admission novelty is the *structural identity*** (shape fields;
+  magnitude/persistence bins excluded — otherwise a drifting trajectory
+  floods the corpus, a Phase-2 finding measured at ~3300 admissions in 12s
+  on the golden demo).
+
+The 205-detector dsfb-debug substrate is Phase 3 (`dsfb/debug_bridge.rs`);
+it is not stubbed now.
 
 ## 13. Scheduler
 
-Explicit scheduling classes (Phase 1/2): EXPLORE, AMPLIFY, DISCRIMINATE,
-FALSIFY, with configurable deterministic weighted round-robin and integer
-priority components (feature rarity, morphology novelty, input size,
-execution cost, stability, boundary proximity, precedent ambiguity);
-deterministic tie-breaking. No opaque single floating-point score.
+Explicit scheduling classes (`scheduler/policy.rs`): EXPLORE (uniform
+parents, rotated families) and AMPLIFY (re-mutate a drifting lineage's
+frontier with the exact drifting family, continuing its index space), with
+configurable deterministic weighted round-robin (a pure function of the
+campaign seed and a per-planner counter). DISCRIMINATE/FALSIFY arrive with
+the precedent bank (Phase 3). The amplify queue is bounded
+(`MAX_AMPLIFY_ENTRIES`), populated by batch-drift detection over the worker's
+signal summaries (persistence run + cumulative magnitude), re-anchored to
+advance the frontier when a new descendant is admitted (with a one-shot
+freshness boost so the ladder climbs one rung per order), and dropped when a
+finding terminates the lineage (the boundary was reached). Integer
+priorities only; all ties break deterministically (entry ID order).
 
 ## 14. Tapes, precedents, boundaries, influence
 
-* `RunTape` (Phase 2): immutable, content-addressed; the deterministic
-  contract is `same valid tape -> same frf-fuzz structural interpretation`,
-  not "OS scheduling is deterministic". Tape design follows DSFB-Database's
-  JSONL+sidecar-hash+verify-on-load lesson, reimplemented locally.
+* `RunTape` (`tape/model.rs`): immutable, content-addressed, with build and
+  environment digests, the exact candidate (or its coordinate), the
+  scheduler mode, the recorded observation, termination status, lineage
+  context, and source (seed/finding/admission/boundary/replay). Written at
+  durable boundaries only: seeds, findings, residual admissions, boundary
+  witnesses. The deterministic contract is `same valid tape -> same frf-fuzz
+  structural interpretation` (the interpretation is a pure function of the
+  recorded fields); `tape/replay.rs` additionally checks that a live
+  re-execution reproduces the recorded observation, and a divergence is
+  PRESERVED as instability (I10) — never resolved by overwriting.
 * Precedent bank (Phase 3): durable trajectories with structural prefix,
   context predicates, known continuations, counterexamples, confusers,
   discriminating probes, FRF receipt IDs, Gemel IDs, provenance. Every
   precedent carries >= 1 falsifiable experimental relationship. Contradicted
   precedents are retained (I10).
-* Boundary witnesses (Phase 2): passing/failing pairs minimized two-sided.
-* InfluenceSketch (Phase 2): hierarchical perturbation (mutate chunk ->
+* Boundary witnesses (`boundary/`): passing/failing pairs are first-class
+  objects (`BoundaryWitness` with the preserved relation and verification
+  status); `minimize.rs` implements deterministic two-sided minimization
+  (greedy coordinate descent + length trimming, byte index ascending, left
+  before right) shrinking the distance while preserving the distinction.
+  `frf-fuzz boundary <finding-id>` forms the stable/crash pair of a finding
+  vs its corpus parent, minimizes it, and persists the verified witness +
+  tapes.
+* InfluenceSketch (Phase 2.5+): hierarchical perturbation (mutate chunk ->
   observe -> retain -> subdivide). Explicitly NOT sound taint analysis; false
   positives/negatives documented.
 
@@ -328,16 +380,18 @@ async streams, remove-without-semantic-change.
 
 ## 18. Module layout
 
-See `src/lib.rs` for the current tree. Phase-1 modules: `error`, `canon`,
-`id` (coordinator), `mutation/{mod,prng,coordinate,bytes,integer,splice,
-dictionary,cmp,influence}` (ungated; shared with workers), `simd/{mod,
-scalar,x86_avx2}`, `scheduler/{work_order (ungated),policy}`,
-`execute/{protocol,crash_ledger (ungated),finding,worker_process,
-coordinator}`, `target_runtime/{sancov,cmp,signals,target,worker}`,
-`store/{object,refs,fsck}`, `corpus/{entry,admission,minimize}`,
-`report`, `cli` (coordinator), `bin/{frf-fuzz,cargo-frf-fuzz}`. Later
-phases add `observe/`, `dsfb/`, `precedent/`, `boundary/`, `tape/`, `gpu/`,
-`frf_bridge.rs`, `gemel_bridge.rs`.
+See `src/lib.rs` for the current tree. Ungated modules (shared with the
+instrumented target): `error`, `canon`, `mutation/{mod,prng,coordinate,
+bytes,integer,splice,dictionary,cmp,influence}`, `simd/{mod,scalar,
+x86_avx2}`, `scheduler/work_order`, `execute/{protocol,crash_ledger}`,
+`target_runtime/{sancov,cmp,signals,target,worker}`. Coordinator-gated:
+`id`, `store/{object,refs,fsck}`, `corpus/{entry,admission,minimize}`,
+`observe/{frame,residual,signals,sketch}`, `dsfb/{regime,morphology}`,
+`scheduler/policy`, `execute/{finding,worker_process,coordinator}`,
+`boundary/{witness,minimize}`, `tape/{model,replay}`, `report`, `cli`,
+`bin/{frf-fuzz,cargo-frf-fuzz}`. Later phases add `precedent/`, `gpu/`,
+`frf_bridge.rs`, `gemel_bridge.rs`, `dsfb/{debug_bridge,fuzz_bank,
+database_bridge}`.
 
 `bin/frf-fuzz.rs` and `bin/cargo-frf-fuzz.rs` are thin argv adapters to
 `frf_fuzz::cli` — no duplicated command logic.

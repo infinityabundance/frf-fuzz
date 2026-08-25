@@ -156,6 +156,52 @@ impl CorpusIndex {
         let idx = rng.gen_index(self.entries.len());
         Some(*self.entries.keys().nth(idx).unwrap())
     }
+
+    /// Walk the parent chain to the seed ancestor of an entry.
+    pub fn root_of(&self, id: &ContentId) -> Option<ContentId> {
+        let mut cur = *id;
+        for _ in 0..=self.entries.len() {
+            let meta = self.entries.get(&cur)?;
+            match meta.parent_id {
+                Some(p) => cur = p,
+                None => return Some(cur),
+            }
+        }
+        None // cycle (corrupt metadata; fsck territory)
+    }
+
+    /// Resolve an 8-byte short key to a full content ID (deterministic: the
+    /// lowest full ID with that prefix — a lookup hint, not identity).
+    pub fn entry_by_short(&self, short: [u8; 8]) -> Option<ContentId> {
+        self.entries.keys().find(|id| id.short() == short).copied()
+    }
+
+    /// The lineage chain of an entry: the parent-first path from its seed
+    /// ancestor, including only edges whose mutator matches `mutator`
+    /// (deterministic; used by lineage/regime rebuild replay).
+    pub fn lineage_chain(&self, id: &ContentId, mutator: u16) -> Vec<&CorpusMeta> {
+        let mut chain = Vec::new();
+        let mut cur = Some(*id);
+        while let Some(c) = cur {
+            let Some(meta) = self.entries.get(&c) else {
+                break;
+            };
+            if meta.mutator_id == Some(mutator) {
+                chain.push(meta);
+            }
+            cur = meta.parent_id;
+        }
+        chain.reverse(); // parent-first
+        chain
+    }
+
+    /// All entries sorted by admission sequence (deterministic rebuild
+    /// order for lineage/regime replay).
+    pub fn by_admission_order(&self) -> Vec<&CorpusMeta> {
+        let mut v: Vec<&CorpusMeta> = self.entries.values().collect();
+        v.sort_by_key(|m| (m.admission_seq, m.entry_id));
+        v
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +226,10 @@ mod tests {
             generation: 0,
             features: vec![1, 2, 3],
             reason: AdmissionReason::Seed,
+            signals: crate::target_runtime::signals::SignalVector::new(),
+            mutator_id: None,
+            morphology_id: None,
+            admission_seq: 0,
         };
         s.put(Family::CorpusMeta, &entry::encode_meta(&meta).unwrap())
             .unwrap();
@@ -205,6 +255,10 @@ mod tests {
                     generation: 0,
                     features: vec![u64::from(i)],
                     reason: AdmissionReason::Seed,
+                    signals: crate::target_runtime::signals::SignalVector::new(),
+                    mutator_id: None,
+                    morphology_id: None,
+                    admission_seq: 0,
                 })
                 .unwrap();
         }
@@ -226,6 +280,10 @@ mod tests {
             generation: 0,
             features: vec![],
             reason: AdmissionReason::Seed,
+            signals: crate::target_runtime::signals::SignalVector::new(),
+            mutator_id: None,
+            morphology_id: None,
+            admission_seq: 0,
         };
         index.insert_meta(meta.clone()).unwrap();
         assert!(index.insert_meta(meta).is_err());

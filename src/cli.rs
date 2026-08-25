@@ -61,6 +61,7 @@ pub fn run(args: &[String]) -> i32 {
         "replay" => finish("replay", cmd_replay(&args[1..])),
         "tmin" => finish("tmin", cmd_tmin(&args[1..])),
         "cmin" => finish("cmin", cmd_cmin(&args[1..])),
+        "boundary" => finish("boundary", cmd_boundary(&args[1..])),
         "inspect" => finish("inspect", cmd_inspect(&args[1..])),
         "report" => finish("report", cmd_report(&args[1..])),
         "fsck" => finish("fsck", cmd_fsck(&args[1..])),
@@ -106,9 +107,11 @@ fn print_usage() {
          \x20 frf-fuzz run <name> [--workers N] [--batch-size N] [--seed <dir>]\n\
          \x20                 [--max-time <secs>] [--max-execs N] [--sanitizer none|address]\n\
          \x20                 [--nightly <tc>] [--memory-limit-mb N] [--root <path>] [--rebuild]\n\
-         \x20 frf-fuzz replay <finding-id> [--root <path>]\n\
-         \x20 frf-fuzz tmin <finding-id> [--root <path>] [--max-verify N]\n\
+         \x20                 [--residual on|off] [--explore-weight N] [--amplify-weight N]\n\
+         \x20 frf-fuzz replay <finding-id> [--root <path>] [--target <name>]\n\
+         \x20 frf-fuzz tmin <finding-id> [--root <path>] [--target <name>] [--max-verify N]\n\
          \x20 frf-fuzz cmin <name> [--root <path>]\n\
+         \x20 frf-fuzz boundary <finding-id> [--root <path>] [--target <name>] [--max-verify N]\n\
          \x20 frf-fuzz inspect <id> [--root <path>]\n\
          \x20 frf-fuzz report [--root <path>] [--json]\n\
          \x20 frf-fuzz fsck [--root <path>]\n\
@@ -1112,20 +1115,7 @@ fn cmd_init(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
-const INIT_CONFIG: &str = "# frf-fuzz store configuration (Phase 1)
-# Defaults shown; a campaign overrides these per invocation.
-
-[campaign]
-# Mutation batches per work order (<= 4096).
-# batch_size = 1000
-# Per-execution watchdog timeout in milliseconds.
-# timeout_ms = 5000
-
-[worker]
-# Optional RLIMIT_AS per worker in MiB (0 = no limit). ASan builds need
-# generous limits (shadow memory), so this defaults to off.
-# memory_limit_mb = 0
-";
+const INIT_CONFIG: &str = "# frf-fuzz store configuration (Phase 2)\n# Defaults shown; a campaign overrides these per invocation.\n\n[campaign]\n# Mutation batches per work order (<= 4096).\n# batch_size = 1000\n# Per-execution watchdog timeout in milliseconds.\n# timeout_ms = 5000\n# Residual-guided admission + EXPLORE/AMPLIFY scheduling (ablation switch).\n# residual = true\n# Weighted round-robin between scheduling classes (EXPLORE, AMPLIFY).\n# explore_weight = 4\n# amplify_weight = 1\n\n[worker]\n# Optional RLIMIT_AS per worker in MiB (0 = no limit). ASan builds need\n# generous limits (shadow memory), so this defaults to off.\n# memory_limit_mb = 0\n";
 
 /// `frf-fuzz add <name>`
 fn cmd_add(args: &[String]) -> Result<i32> {
@@ -1172,23 +1162,25 @@ fn target_template(name: &str) -> String {
          //! Build: `cargo frf-fuzz build {name}`   Run: `cargo frf-fuzz run {name}`\n\
          //!\n\
          //! The closure receives the candidate input and a [`FuzzContext`].\n\
-         //! The target-runtime surface is minimal on purpose; semantic\n\
-         //! signals arrive in Phase 2 (`cx.observe_u64`).\n\
+         //! Semantic signals (Phase 2) are registered once in `setup` and\n\
+         //! observed per execution via `cx.observe_u64`.\n\
          \n\
-         use frf_fuzz::target_runtime::FuzzContext;\n\
+         use frf_fuzz::target_runtime::{{FuzzContext, SignalId}};\n\
          \n\
-         frf_fuzz::fuzz_target!(|data: &[u8], cx: &mut FuzzContext| {{ \n\
-         \x20   let _ = (data, cx);\n\
-         \x20   // TODO: drive the code under test. For example:\n\
-         \x20   //   let _ = mycrate::parse(data);\n\
-         \x20   // Optional hooks (setup / reset / teardown) are supported:\n\
-         \x20   // frf_fuzz::fuzz_target!(\n\
-         \x20   //     setup   = || {{ init_state(); Ok(()) }},\n\
-         \x20   //     reset   = |cx: &mut FuzzContext| {{ reset_state(); Ok(()) }},\n\
-         \x20   //     execute = |data: &[u8], cx: &mut FuzzContext| {{ run(data) }},\n\
-         \x20   //     teardown= || {{ flush(); Ok(()) }},\n\
-         \x20   // );\n\
-         }});\n"
+         frf_fuzz::fuzz_target!(\n\
+         \x20   setup = |cx: &mut FuzzContext| {{\n\
+         \x20       // Register the semantic signals this target observes (once).\n\
+         \x20       cx.register_signal(SignalId(0), \"parsed_items\", \"count\")?;\n\
+         \x20       Ok(())\n\
+         \x20   }},\n\
+         \x20   execute = |data: &[u8], cx: &mut FuzzContext| {{\n\
+         \x20       let _ = data;\n\
+         \x20       // TODO: drive the code under test. For example:\n\
+         \x20       //   let parsed = mycrate::parse(data)?;\n\
+         \x20       //   cx.observe_u64(SignalId(0), parsed.len() as u64)?;\n\
+         \x20       Ok(())\n\
+         \x20   }},\n\
+         );\n"
     )
 }
 
@@ -1253,6 +1245,23 @@ fn cmd_run(args: &[String]) -> Result<i32> {
     if let Some(s) = flag_value(args, "--seed") {
         policy.seed = parse_u64(&s, "--seed")?;
     }
+    if let Some(r) = flag_value(args, "--residual") {
+        policy.residual = match r.as_str() {
+            "on" | "1" | "true" => true,
+            "off" | "0" | "false" => false,
+            other => {
+                return Err(crate::error::Error::Other(format!(
+                    "--residual must be on|off (got `{other}`)"
+                )));
+            }
+        };
+    }
+    if let Some(w) = flag_value(args, "--explore-weight") {
+        policy.class_weights[0] = parse_u64(&w, "--explore-weight")?;
+    }
+    if let Some(w) = flag_value(args, "--amplify-weight") {
+        policy.class_weights[1] = parse_u64(&w, "--amplify-weight")?;
+    }
     let seed_dir = flag_value(args, "--seed-dir").map(PathBuf::from);
     let max_time = flag_value(args, "--max-time").map(|s| {
         let secs: u64 = parse_u64(&s, "--max-time").unwrap_or(0);
@@ -1289,8 +1298,8 @@ fn cmd_run(args: &[String]) -> Result<i32> {
     crate::execute::coordinator::install_sigint_handler();
     eprintln!("[run] target: {}", cfg.target_bin.display());
     eprintln!(
-        "[run] workers: {} batch: {} seed: {:#x}",
-        cfg.policy.workers, cfg.policy.batch_size, cfg.policy.seed
+        "[run] workers: {} batch: {} seed: {:#x} residual: {}",
+        cfg.policy.workers, cfg.policy.batch_size, cfg.policy.seed, cfg.policy.residual
     );
     let summary = crate::execute::coordinator::run_campaign(&cfg)?;
     println!(
@@ -1305,6 +1314,13 @@ fn cmd_run(args: &[String]) -> Result<i32> {
     println!("  executions: {}", summary.executions);
     println!("  corpus entries: {}", summary.corpus_entries);
     println!("  coverage features: {}", summary.features);
+    println!("  state features: {}", summary.state_features);
+    println!("  morphologies: {}", summary.morphologies);
+    println!("  regime episodes (closed): {}", summary.regimes);
+    println!("  regime trajectories (open): {}", summary.open_episodes);
+    println!("  boundary witnesses: {}", summary.boundaries);
+    println!("  run tapes: {}", summary.tapes);
+    println!("  amplify orders: {}", summary.amplify_orders);
     println!("  findings: {}", summary.findings);
     println!("  duration: {:.1}s", summary.duration.as_secs_f64());
     Ok(0)
@@ -1365,10 +1381,14 @@ impl Session {
         }
     }
 
-    /// Verify one input: `Ok(true)` means the worker DIED executing it
-    /// (crash or watchdog timeout — both are "the process does not survive").
-    /// `Ok(false)` means it ran to completion.
-    fn verify(&mut self, input: &[u8]) -> Result<bool> {
+    /// Verify one input: `Ok((died, signals, features))` where `died` means
+    /// the worker DIED executing it (crash or watchdog timeout — both are
+    /// "the process does not survive"), and `signals`/`features` are the
+    /// recorded observation when it survived (empty when it died).
+    fn verify(
+        &mut self,
+        input: &[u8],
+    ) -> Result<(bool, crate::target_runtime::signals::SignalVector, Vec<u64>)> {
         if self.worker.is_none() {
             self.worker = Some(crate::execute::worker_process::WorkerHandle::spawn(
                 &self.cfg.target_bin,
@@ -1385,12 +1405,16 @@ impl Session {
         let order = override_order_for(&self.cfg.policy, seq, input.to_vec());
         w.send_order(&order)?;
         match w.recv_result() {
-            Ok(_) => Ok(false),
+            Ok(r) => Ok((false, r.override_signals, r.override_features)),
             Err(_) => {
                 // The worker died; drop it (a fresh one is spawned next).
                 let mut dead = self.worker.take().unwrap();
                 let _ = dead.wait();
-                Ok(true)
+                Ok((
+                    true,
+                    crate::target_runtime::signals::SignalVector::new(),
+                    Vec::new(),
+                ))
             }
         }
     }
@@ -1411,6 +1435,7 @@ fn override_order_for(
         index_count: 1,
         parent: Vec::new(),
         parent_short: [0; 8],
+        parent_signals: crate::target_runtime::signals::SignalVector::new(),
         partner: Vec::new(),
         dictionary: Vec::new(),
         new_features: Vec::new(),
@@ -1487,7 +1512,7 @@ fn cmd_replay(args: &[String]) -> Result<i32> {
     })?;
     let cfg = session_config(&name, args)?;
     let mut session = Session::new(cfg);
-    let died = session.verify(&finding.input)?;
+    let (died, _, _) = session.verify(&finding.input)?;
     if died {
         println!("result: REPRODUCED (the worker dies on this input)");
     } else {
@@ -1544,7 +1569,10 @@ fn cmd_tmin(args: &[String]) -> Result<i32> {
             return false;
         }
         verifications += 1;
-        session.verify(input).unwrap_or(false)
+        session
+            .verify(input)
+            .map(|(died, _, _)| died)
+            .unwrap_or(false)
     };
     let minimized = crate::corpus::minimize::minimize_input(&finding.input, &mut verify);
     println!(
@@ -1622,6 +1650,161 @@ fn cmd_cmin(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
+/// `frf-fuzz boundary <finding-id>` — two-sided minimization of a
+/// counterfactual boundary pair (acceptance item 13).
+///
+/// Forms (or reuses) the StableCrash pair of a crash finding vs its corpus
+/// parent, then deterministically shrinks the byte distance between the two
+/// sides while preserving the distinction (left survives, right dies),
+/// verifies the result deliberately, and persists the minimized witness +
+/// a run tape.
+fn cmd_boundary(args: &[String]) -> Result<i32> {
+    let id = args.iter().find(|a| !a.starts_with('-')).ok_or_else(|| {
+        crate::error::Error::Other("usage: frf-fuzz boundary <finding-id>".into())
+    })?;
+    let root = project_root(args);
+    let store_root = store_root_of(&root);
+    let store = crate::store::Store::open(store_root.clone())?;
+    let id = crate::id::ContentId::from_hex(id)?;
+    let payload = store
+        .get(&id)?
+        .ok_or_else(|| crate::error::Error::Other(format!("no object {id}")))?;
+    let finding = crate::execute::finding::decode_finding(&payload)?;
+    let name = flag_value(args, "--target").ok_or_else(|| {
+        crate::error::Error::Other(
+            "boundary needs `--target <name>` to know which instrumented binary to run".into(),
+        )
+    })?;
+    let cfg = session_config(&name, args)?;
+
+    // The left side: the corpus entry matching the finding's parent short
+    // key (a crash finding's parent is the input whose mutation crossed the
+    // boundary).
+    let index = crate::corpus::CorpusIndex::rebuild(&store)?;
+    let left_id = index.entry_by_short(finding.parent_short).ok_or_else(|| {
+        crate::error::Error::Other(
+            "finding parent is not in the corpus (it was admitted in an earlier campaign?); \
+                 pass `--left <corpus-id>` to choose the left side explicitly"
+                .into(),
+        )
+    })?;
+    let left_input = store
+        .get(&left_id)?
+        .ok_or_else(|| crate::error::Error::Other("left corpus entry missing".into()))?;
+    let right_input = finding.input.clone();
+
+    println!(
+        "boundary: pair {} ({}B, corpus) vs {} ({}B, crash)",
+        left_id,
+        left_input.len(),
+        id,
+        right_input.len()
+    );
+    println!(
+        "  relation: stable-crash, distance: {}",
+        crate::boundary::minimize::byte_distance(&left_input, &right_input)
+    );
+
+    let max_verify: u64 = flag_value(args, "--max-verify")
+        .map(|s| parse_u64(&s, "--max-verify"))
+        .transpose()?
+        .unwrap_or(200_000);
+    let mut session = Session::new(cfg);
+    let verifications = std::cell::Cell::new(0u64);
+    let mut classify = |input: &[u8]| -> crate::error::Result<crate::boundary::minimize::PairSide> {
+        if verifications.get() >= max_verify {
+            return Err(crate::error::Error::Other(
+                "boundary verification budget exhausted".into(),
+            ));
+        }
+        verifications.set(verifications.get() + 1);
+        let (died, _, _) = session.verify(input)?;
+        Ok(if died {
+            crate::boundary::minimize::PairSide::Right
+        } else {
+            crate::boundary::minimize::PairSide::Left
+        })
+    };
+
+    // The pair must already be a valid boundary (left survives, right dies).
+    if classify(&left_input)? != crate::boundary::minimize::PairSide::Left
+        || classify(&right_input)? != crate::boundary::minimize::PairSide::Right
+    {
+        return Err(crate::error::Error::Other(
+            "the pair does not preserve a stable-crash distinction (left must survive, right must die)"
+                .into(),
+        ));
+    }
+
+    let outcome = crate::boundary::minimize::minimize_pair(
+        &left_input,
+        &right_input,
+        max_verify.saturating_sub(verifications.get()),
+        &mut classify,
+    )?;
+    println!(
+        "  minimized: distance {} -> {} ({} verifications)",
+        outcome.start_distance,
+        outcome.end_distance,
+        verifications.get()
+    );
+    println!(
+        "  left  ({}B): {}",
+        outcome.left.len(),
+        hex_dump(&outcome.left)
+    );
+    println!(
+        "  right ({}B): {}",
+        outcome.right.len(),
+        hex_dump(&outcome.right)
+    );
+
+    // Persist the minimized witness + a boundary tape (durable, I10/I12).
+    let witness = crate::boundary::witness::BoundaryWitness {
+        left: left_id,
+        right: id,
+        left_input: outcome.left.clone(),
+        right_input: outcome.right.clone(),
+        relation: crate::boundary::witness::BoundaryRelation::StableCrash,
+        distance: outcome.end_distance,
+        verification: crate::boundary::witness::WitnessVerification::Verified,
+        tape: None,
+    };
+    let payload = crate::boundary::witness::encode_witness(&witness)?;
+    let witness_id = store.put(crate::canon::Family::BoundaryWitness, &payload)?;
+
+    // A boundary tape recording both sides (deterministic replay contract).
+    let env = crate::tape::model::environment_digest(
+        &name,
+        "",
+        "",
+        crate::execute::worker_process::SanitizerMode::None.wire_mode(),
+    );
+    let build = crate::tape::model::build_digest(&name, "", "", &[]);
+    for (side_input, is_right) in [(&outcome.left, false), (&outcome.right, true)] {
+        let tape = crate::tape::model::RunTape {
+            build_digest: build,
+            environment_digest: env,
+            candidate: side_input.clone(),
+            coordinate: None,
+            scheduler_mode: 0,
+            observation: None,
+            termination: if is_right {
+                crate::tape::model::TerminationStatus::Crash
+            } else {
+                crate::tape::model::TerminationStatus::Ok
+            },
+            lineage: None,
+            source: crate::tape::model::TapeSource::Boundary,
+        };
+        let payload = crate::tape::model::encode_tape(&tape)?;
+        store.put(crate::canon::Family::RunTape, &payload)?;
+    }
+    println!("  boundary witness: {witness_id}");
+    println!("  next: `frf-fuzz inspect {witness_id}`");
+    Ok(0)
+}
+
 /// `frf-fuzz inspect <id>`
 fn cmd_inspect(args: &[String]) -> Result<i32> {
     let id = args
@@ -1667,6 +1850,106 @@ fn cmd_inspect(args: &[String]) -> Result<i32> {
                     m.features.len(),
                     &m.features[..m.features.len().min(16)]
                 );
+                println!(
+                    "signals: touched={:016x} values={:?}",
+                    m.signals.touched_mask(),
+                    &m.signals.as_slice()[..crate::target_runtime::signals::MAX_SIGNALS.min(8)]
+                );
+                println!(
+                    "mutator: {}",
+                    m.mutator_id
+                        .map(|x| x.to_string())
+                        .unwrap_or_else(|| "(seed)".into())
+                );
+                println!(
+                    "morphology: {}",
+                    m.morphology_id
+                        .map(|x| x.to_hex())
+                        .unwrap_or_else(|| "(none)".into())
+                );
+                println!("admission_seq: {}", m.admission_seq);
+            }
+        }
+        crate::canon::Family::MorphologySignature => {
+            if let Ok(sig) = crate::dsfb::morphology::MorphologySignature::decode(payload) {
+                let class = crate::dsfb::morphology::classify(&sig);
+                println!("class: {}", class.name());
+                println!("axis_mask: {:016x}", sig.axis_mask);
+                if let Some(axis) = sig.dominant_axis() {
+                    println!("dominant_axis: {axis}");
+                    println!("  dir: {}", sig.dir(axis as usize));
+                    println!("  mag_bin: {}", sig.mag_bin(axis as usize));
+                    println!("  slew: {}", sig.slew_bins[axis as usize]);
+                    println!("  persistence: {}", sig.persistence[axis as usize]);
+                }
+                println!("cmp_convergence: {}", sig.cmp_convergence);
+                println!("state_change: {}", sig.state_change);
+                println!("replay_stability: {}", sig.replay_stability);
+                println!("structured_unknown: {}", sig.structured_unknown);
+                println!("depth: {}", sig.depth);
+            }
+        }
+        crate::canon::Family::RunTape => {
+            if let Ok(t) = crate::tape::model::decode_tape(payload) {
+                println!("termination: {}", t.termination.name());
+                println!("source: {}", t.source.name());
+                println!(
+                    "candidate ({}B): {}",
+                    t.candidate.len(),
+                    hex_dump(&t.candidate)
+                );
+                println!("coordinate: {:?}", t.coordinate);
+                println!(
+                    "observation: {}",
+                    t.observation
+                        .map(|o| format!(
+                            "{} features, {:?} signals",
+                            o.features.len(),
+                            o.signals.touched_mask()
+                        ))
+                        .unwrap_or_else(|| "(none — window never completed)".into())
+                );
+                println!(
+                    "lineage: {}",
+                    t.lineage
+                        .map(|l| format!("root {} mutator {}", l.root, l.mutator))
+                        .unwrap_or_else(|| "(none)".into())
+                );
+            }
+        }
+        crate::canon::Family::BoundaryWitness => {
+            if let Ok(w) = crate::boundary::witness::decode_witness(payload) {
+                println!("left: {} ({}B)", w.left, w.left_input.len());
+                println!("right: {} ({}B)", w.right, w.right_input.len());
+                println!("relation: {}", w.relation.name());
+                println!("distance: {}", w.distance);
+                println!("verification: {}", w.verification.name());
+                println!(
+                    "tape: {}",
+                    w.tape
+                        .map(|t| t.to_hex())
+                        .unwrap_or_else(|| "(none)".into())
+                );
+            }
+        }
+        crate::canon::Family::RegimeEpisode => {
+            if let Ok(e) = crate::dsfb::regime::decode_episode(payload) {
+                println!("signal: {}", e.signal);
+                println!(
+                    "state path: stable -> drift -> in-episode (onset {}) -> peak {} -> close {}",
+                    e.onset_ordinal, e.peak_ordinal, e.close_ordinal
+                );
+                println!("peak deviation: {}", e.peak_deviation);
+                println!("dwell: {}", e.dwell);
+                println!("closed by: {}", e.closed_by.name());
+            }
+        }
+        crate::canon::Family::SignalSchema => {
+            if let Ok(s) = crate::observe::signals::decode_signal_schema(payload) {
+                println!("registered signals ({}):", s.count);
+                for (id, d) in s.iter() {
+                    println!("  #{} {} ({})", id.id(), d.name_str(), d.unit_str());
+                }
             }
         }
         _ => {

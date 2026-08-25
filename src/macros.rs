@@ -32,15 +32,11 @@
 #[macro_export]
 macro_rules! fuzz_target {
     // ---- hook form: any order, execute required at build time ----
-    (@mk setup $e:expr) => { .setup($e) };
-    (@mk execute $e:expr) => { .execute($e) };
-    (@mk reset $e:expr) => { .reset($e) };
-    (@mk teardown $e:expr) => { .teardown($e) };
     ($($hook:ident = $closure:expr),+ $(,)?) => {
         fn main() {
             $crate::target_runtime::target::run(
                 $crate::target_runtime::target::HooksBuilder::new()
-                    $($crate::fuzz_target!(@mk $hook $closure))*
+                    $(. $hook ($closure))*
                     .finish(),
             );
         }
@@ -80,7 +76,7 @@ mod tests {
 
     #[test]
     fn duplicate_optional_hook_is_refused() {
-        let b = HooksBuilder::new().setup(|| Ok(()));
-        assert!(std::panic::catch_unwind(|| b.setup(|| Ok(()))).is_err());
+        let b = HooksBuilder::new().setup(|_cx| Ok(()));
+        assert!(std::panic::catch_unwind(|| b.setup(|_cx| Ok(()))).is_err());
     }
 }
