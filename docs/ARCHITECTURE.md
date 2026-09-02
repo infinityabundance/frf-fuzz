@@ -333,9 +333,26 @@ locally, with semantics documented independently of SQL (I7):
   wall-clock). Episodes reset their deviation baseline at close so a later
   regime opens its own bounded episode. Closed episodes are durable
   `Family::RegimeEpisode` objects. The real `dsfb-database` crate (feature
-  `database`) is used only for real database telemetry targets (Phase 6);
+  `database`) is used only for real database telemetry targets;
   generic fuzz residuals can never be coerced into its `ResidualClass` —
   no conversion exists (I7).
+* `dsfb/database_bridge.rs` (Phase 6, feature `database`) — the ONE place
+  the real `dsfb-database` crate meets frf-fuzz code. `TelemetryRow` is a
+  closed enum of SQL-telemetry rows (query-class latency/baseline, plan
+  change, cardinality estimate-vs-actual, lock-wait seconds/chain depth,
+  cache hit ratio, I/O amplification, workload JS divergence). Each variant
+  pushes through the crate's OWN SQL-semantics constructor, so a
+  `ResidualClass` value is chosen only by the constructor the variant
+  dispatches to — never from a bare value and a tag (I7). `analyze` runs
+  the real `MotifEngine` over the sorted real `ResidualStream` and returns
+  bounded episodes + the crate's deterministic replay fingerprint
+  (`grammar::replay`; dsfb-database namespace). Rows are validated before
+  they can reach the crate (finite, class-ranged, bounded labels/time);
+  hostile rows are refused, never coerced. The generic fuzz machinery is
+  never imported here (source-level lock test + `compile_fail` doctest).
+  Demonstration: `examples/db_regression_demo.rs` (same raw tape, clean vs
+  frozen-baseline distiller revision -> the real grammar sees a
+  `plan_regression_onset` episode appear in the regressed revision only).
 * `dsfb/morphology.rs::MorphologySignature` — an inspectable deterministic
   shape (axis mask, direction bits, magnitude/slew/persistence bins,
   coactivation, comparison-convergence class, state-change class, replay
@@ -524,8 +541,10 @@ admission,minimize}`, `observe/{frame,residual,signals,sketch}`,
 `precedent/{mod,model,matching,probe,admission}`, `scheduler/policy`,
 `execute/{finding,worker_process,coordinator}`, `boundary/{witness,
 minimize}`, `tape/{model,replay,revision}`, `frf_bridge`, `gemel_bridge`,
-`report`, `cli`, `bin/{frf-fuzz,cargo-frf-fuzz}`. Later phases add `gpu/`
-and `dsfb/database_bridge`.
+`report`, `cli`, `bin/{frf-fuzz,cargo-frf-fuzz}`. Later phases add `gpu/`.
+`dsfb/database_bridge` (Phase 6) is compiled only when the `database`
+feature is enabled; it is the sole frf-fuzz module that links
+`dsfb-database`.
 
 `bin/frf-fuzz.rs` and `bin/cargo-frf-fuzz.rs` are thin argv adapters to
 `frf_fuzz::cli` — no duplicated command logic.

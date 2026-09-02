@@ -224,12 +224,16 @@ contamination, measured speedup on realistic batch sizes. cudarc (CUDA
 11.4..13.x) and rocmrc (younger) are the fallback adapters. The GPU work
 itself must not force a further MSRV raise.
 
-## 7. Database (Phase 6 gates)
+## 7. Database (Phase 6, verified)
 
-`dsfb-database = { version = "=0.1.1", default-features = false }`; add
-`report` only for JSON/PNG sidecars and `live-postgres` only for the live
-tokio+postgres adapter path. The tape lesson is reimplemented locally (the
-crate's `Tape` is trapped behind `live-postgres`).
+`dsfb-database = { version = "=0.1.1", default-features = false }`. The
+`database` feature compiles `dsfb/database_bridge.rs` — the single frf-fuzz
+module that links the crate — inside the coordinator `dsfb` tree. With
+`default-features = false` the crate pulls no tokio/postgres/otel/plotters
+(verified from its manifest); the `report`/`live-postgres` features are NOT
+enabled and their machinery is never compiled into frf-fuzz. The tape lesson
+was reimplemented locally in Phase 2 (the crate's own `Tape` is trapped
+behind `live-postgres`).
 
 ## 8. Non-x86_64
 
@@ -295,3 +299,37 @@ the single-threaded worker discipline (portable), not on x86 atomicity
   indices, cmp wire encoding, mutation coordinates, and object layouts are
   untouched. The 0.5.0 release is drop-in compatible with 0.4.x stores and
   tapes.
+
+## 11. Phase-6 integration notes (database)
+
+* The bridge lives behind the `database` feature AND the `coordinator`
+  feature (the `dsfb/` tree is coordinator-gated). A pure `target-runtime`
+  build never compiles it; a database-telemetry fuzz SURFACE (the code under
+  test) does not need the feature at all — it decodes its own wire format in
+  its own harness. The feature is for the analysis side: replaying declared
+  SQL-telemetry rows through the real `dsfb-database` grammar.
+* `TelemetryRow` values are the ONLY frf-fuzz input to the crate. There is
+  no `From`/`TryFrom` between any frf-fuzz generic type and
+  `dsfb_database::residual::{ResidualClass, ResidualSample}`; the module
+  never imports the generic fuzz machinery (`no_generic_types_cross_the_
+  boundary` source lock + `compile_fail` doctest). This is the Phase-3
+  design doc's promised enforcement lock (DESIGN-DSFB.md, I7).
+* Rows are validated (finite metrics, class-appropriate ranges, bounded
+  channel labels <= 128 bytes, bounded logical time <= 2^40 ms, <= 2^16
+  rows/stream) and refused — never coerced — before they reach the crate.
+  `Error::Other`/`BoundExceeded` carry the reason; nothing is silently
+  dropped.
+* `analyze` runs the real `MotifEngine` with the crate's default grammar
+  (its `spec/motifs.yaml` numbers). Determinism is the crate's own replay
+  fingerprint (`grammar::replay::fingerprint_hex`, SHA-256 over episode
+  field LE bytes). The fingerprint is a dsfb-database namespace id — it is
+  never reinterpreted as a frf-fuzz object ID or a Gemel Gid.
+* Episode `t_start/t_end/peak/ema` are f64 seconds/units from the crate.
+  They appear only in analysis VIEWS and prints; frf-fuzz canonical identity
+  stays integer-based. No SQL episode object is persisted to the frf-fuzz
+  store in Phase 6 (episodes are an analysis artifact of declared rows); a
+  durable family would be added only with a real operator workflow.
+* f64 arithmetic determinism is the crate's own contract (its test suite
+  pins SHA-256 fingerprints). frf-fuzz asserts reproducibility of its own
+  analyses on the same build; cross-toolchain float-codegen stability is
+  the pinned crate's concern and its pinned version `=0.1.1` protects it.

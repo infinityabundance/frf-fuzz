@@ -8,8 +8,7 @@
 //!   residual + `Stable → Drift → InEpisode → Recovering` + dwell +
 //!   deterministic episode close. Semantics are documented independently of
 //!   SQL telemetry and generic fuzz residuals are never coerced into a SQL
-//!   `ResidualClass` (I7 — enforced in types; the `database` feature bridge
-//!   is Phase 6).
+//!   `ResidualClass` (I7 — enforced in types; see `database_bridge` below).
 //! * `morphology` — inspectable, deterministic morphology signatures with a
 //!   `Trivial` / `StructuredUnknown` classifier. The `Unknown` discipline is
 //!   DSFB's: a structurally non-trivial observation that matches no named
@@ -23,13 +22,20 @@
 //!   structural classes with gates, refusals, confusers, deterministic
 //!   integer scoring, and the Structured+Unknown discipline as a first-class
 //!   result.
-//!
-//! Phase 6 adds `database_bridge`. It is NOT stubbed here (docs/ROADMAP.md).
+//! * `database_bridge` (Phase 6, feature `database`) — the ONE place the
+//!   real `dsfb-database` crate meets frf-fuzz code, for actual SQL-
+//!   telemetry surfaces only. Declared SQL-telemetry rows are pushed through
+//!   the crate's own SQL-semantics constructors and interpreted by its real
+//!   `MotifEngine`; generic fuzz residuals can never name a SQL class (I7,
+//!   enforced in types + a source-level lock test).
 
 pub mod debug_bridge;
 pub mod fuzz_bank;
 pub mod morphology;
 pub mod regime;
+
+#[cfg(feature = "database")]
+pub mod database_bridge;
 
 pub use debug_bridge::{
     AxisVerdict, BridgeConfig, DriftDir, EdgeStructural, LineageSubstrate, StructuralEpisode,
@@ -41,3 +47,6 @@ pub use morphology::{
     classify, LineageAccumulator, MorphologySignature, StructuralClass, Triviality,
 };
 pub use regime::{EpisodeClose, RegimeConfig, RegimeEpisode, RegimeObserver, RegimeState};
+
+#[cfg(feature = "database")]
+pub use database_bridge::{analyze, build_stream, DbAnalysis, DbEpisodeView, TelemetryRow};

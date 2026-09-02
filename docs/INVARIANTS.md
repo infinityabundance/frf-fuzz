@@ -99,9 +99,11 @@ enum with no generic variant, and no conversion exists between the two
 worlds — the refusal is type-level.
 
 * Code: no `From`/`TryFrom` between fuzz residual types and
-  `ResidualClass`; the `database` feature is the only place the dsfb-database
-  crate appears.
-* Enforcement: the generic fuzz core has no dependency on dsfb-database.
+  `ResidualClass`; `src/dsfb/database_bridge.rs` (feature `database`) is the
+  only module where the dsfb-database crate appears.
+* Enforcement: the generic fuzz core has no dependency on dsfb-database;
+  the bridge imports no generic fuzz machinery (source-lock test
+  `no_generic_types_cross_the_boundary` + `compile_fail` doctest, Phase 6).
 
 ## I8. No GPU result has final semantic authority
 

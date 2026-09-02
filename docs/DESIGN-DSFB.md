@@ -163,8 +163,11 @@ DSFB-Database state machine with its own types and its own documentation:
   the crate's SQL-semantics constructors (`push_latency`, `push_plan_change`,
   `push_wait`, `push_chain_depth`, `push_hit_ratio`, `push_io_amplification`,
   `push_jsd`).
-- Enforcement test (Phase 6): a compile-fail / non-conversion lock, mirroring
-  the crate's own `non_claim_lock.rs` discipline.
+- Enforcement (SHIPPED in Phase 6, `src/dsfb/database_bridge.rs`): a
+  `compile_fail` doctest on `TelemetryRow` plus the
+  `no_generic_types_cross_the_boundary` source lock (mirrors the crate's own
+  `non_claim_lock.rs` discipline). Phase-6 demo: `examples/
+  db_regression_demo.rs`; tests: `tests/phase6_database.rs`.
 
 ### Tape lesson
 

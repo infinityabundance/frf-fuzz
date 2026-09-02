@@ -124,7 +124,8 @@ sh scripts/golden_demo.sh
 | 3 | DSFB endoduction (FuzzSemanticBank, precedents, probes) | **DONE** |
 | 4 | FRF courts (real receipts at promotion) + Gemel durable boundaries + revision tape replay | **DONE** |
 | 5 | AVX2 hardening: measured per-window scan/clear + cmp snapshot wired through runtime-dispatched SIMD; per-execution event-window allocation removed (`examples/phase5_bench`); scalar == AVX2 property-tested | **DONE** |
-| 6-8 | Database specialization, GPU, scientific evaluation | planned |
+| 6 | Database specialization: real `dsfb-database` bridge (`database` feature) with typed rows -> real SQL-semantics constructors -> real `MotifEngine`; type-level I7 refusal (source lock + `compile_fail`); regression demo `cargo run --features database --example db_regression_demo` | **DONE** |
+| 7-8 | GPU, scientific evaluation | planned |
 
 ## The two planes
 

@@ -327,11 +327,55 @@ machine) — never in the per-execution loop.
   (I3 regression). `scripts/unsafe_audit.sh` stays clean (unsafe confined to
   the approved zones; every block has a `// SAFETY:` comment).
 
-## Phase 6 — Database Specialization
+## Phase 6 — Database Specialization (DONE)
 
-- Real dsfb-database bridge behind the `database` feature for actual
-  database telemetry targets; type-level refusal of generic residuals
-  (I7); database historical regression demonstration.
+- `src/dsfb/database_bridge.rs` (feature `database`): the ONE place the real
+  `dsfb-database` 0.1.1 crate meets frf-fuzz code, for actual SQL-telemetry
+  surfaces only. `TelemetryRow` is a CLOSED enum of SQL-telemetry rows
+  (query-class latency/baseline, plan change, estimated-vs-actual
+  cardinality, lock-wait seconds, chain depth, cache hit ratio, I/O
+  amplification, workload JS divergence); each variant dispatches to the
+  crate's OWN SQL-semantics constructor (`plan_regression::push_latency`,
+  `cardinality::push`, `contention::push_wait`, `cache_io::push_hit_ratio`,
+  ...) so a `ResidualClass` can never be chosen from generic fuzz data (I7).
+- `build_stream` -> real `dsfb_database::residual::ResidualStream` (sorted;
+  the crate's "adapters MUST sort" contract); `analyze` runs the real
+  `MotifEngine::new(MotifGrammar::default())` and returns a bounded
+  `DbAnalysis` (per-class episode counts, bounded episode views,
+  `grammar::replay::fingerprint_hex` — a dsfb-database namespace id, never a
+  frf-fuzz object id). Every row is validated (finite metrics,
+  class-appropriate ranges, bounded labels/time) before it can reach the
+  crate; invalid rows are refused, never coerced.
+- Type-level refusal (I7): no `From`/`TryFrom`, no function accepts a
+  frf-fuzz generic residual type, and the module never imports the generic
+  fuzz machinery. Enforced by a source-level lock test
+  (`no_generic_types_cross_the_boundary`) plus a `compile_fail` doctest;
+  `error.rs::Error::Refused` documents the I7 boundary. This ships the
+  Phase-3 design doc's promised "Phase 6 enforcement test"
+  (docs/DESIGN-DSFB.md).
+- `examples/db_regression_demo.rs` — the database historical regression
+  demonstration (run: `cargo run --features database --example
+  db_regression_demo`). One telemetry surface over an IDENTICAL 90 s raw
+  tape under two program states: revision A (clean, previous-sample
+  baseline) vs revision B (baseline frozen at process start — a documented
+  calibration regression). Same parse surface (coverage-blind difference),
+  but the real SQL grammar sees revision B develop a
+  `plan_regression_onset` episode that A never forms, while a genuine
+  LockRow wait ramp is read identically by both (the divergence is specific
+  to the regressed channel). Deterministic fingerprints; 225 raw rows
+  collapse to <= 2 bounded episodes per revision.
+- `tests/phase6_database.rs` (feature `database`): hermetic integration
+  tests over the REAL crate — determinism of the clean/frozen revisions,
+  per-channel episode scoping (two wait events -> two channel-scoped
+  episodes), empty-tape fingerprint lock (SHA-256 of the empty list),
+  hostile-row refusal (NaN/out-of-range/over-long/bounded-count), row-order
+  invariance after sort.
+- Measured on this machine (informational): the demo asserts clean=0 /
+  frozen=1 plan-regression episodes, contention=1 in both, fingerprints
+  differ, and each revision reproduces its own fingerprint exactly across
+  repeated analyses.
+- Docs: `ARCHITECTURE.md` §12, `COMPATIBILITY.md` §7 + §11, `DESIGN-DSFB.md`
+  (Phase-6 enforcement now shipped), `DEPENDENCIES.md` status.
 
 ## Phase 7 — GPU
 

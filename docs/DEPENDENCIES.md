@@ -1,6 +1,6 @@
 # frf-fuzz Dependency Policy and Pin Record
 
-Status: Phase 4. Every dependency exists for a recorded reason. Versions are
+Status: Phase 6. Every dependency exists for a recorded reason. Versions are
 pinned (`=`) for integration-sensitive crates. The core default build stays
 small enough to audit; the target-runtime build is dependency-tiny.
 
@@ -14,7 +14,7 @@ small enough to audit; the target-runtime build is dependency-tiny.
 | `frf` | `=0.1.72` | 1.85 | `coordinator` | Epistemic authority: court questions, receipts, claims, trajectories for promoted findings (Phase 4: `src/frf_bridge.rs` runs real in-process courts at promotion; receipts retained verbatim). No features exist; pulls clap/serde_yaml/tar/base64/sha2/libc unconditionally — the price of real evidence semantics, kept out of the target-runtime build. Its column value is its own declared MSRV; it compiles within the 1.98 build. |
 | `gemel` | `=0.11.0` | 1.85 | `coordinator` | Longitudinal engineering memory: durable boundary objects, state Gids, trajectories, negative knowledge (Phase 4: `src/gemel_bridge.rs` publishes durable boundaries at campaign/verification/precedent points). `rusqlite` bundled requires a C compiler at build time (documented in `doctor`). No features. |
 | `dsfb-debug` | `=0.1.0`, `default-features=false, features=["std"]` | 1.75 | `coordinator` | Structural interpretation substrate (residual/sign/drift/slew/grammar/policy/episode + 205-detector fusion field). With this exact feature set it has ZERO transitive deps (verified from its lockfile). Its motif names are never applied to fuzz behavior (I6). |
-| `dsfb-database` | `=0.1.1`, `default-features=false` | 1.74 | `database` (optional) | Only for real database telemetry targets. With `default-features=false` it pulls no tokio/postgres/otel/plotters (verified). Generic fuzz residuals never become its `ResidualClass` (I7). |
+| `dsfb-database` | `=0.1.1`, `default-features=false` | 1.74 | `database` (optional) | Only for real database telemetry targets. `src/dsfb/database_bridge.rs` (Phase 6) is the single module that links it: `TelemetryRow` variants dispatch to the crate's own SQL-semantics constructors and `analyze` runs its real `MotifEngine`, so generic fuzz residuals never become its `ResidualClass` (I7; source-lock + compile_fail enforcement). With `default-features=false` it pulls no tokio/postgres/otel/plotters (verified). |
 
 MSRV contract: the coordinator declares `rust-version = "1.98"` since Phase
 3 (raised from 1.85 to the current stable, 1.98.0, by deliberate decision).
