@@ -123,7 +123,8 @@ sh scripts/golden_demo.sh
 | 2 | Residual-guided fuzzing (signals, residuals, regimes, morphology, boundaries, tapes) | **DONE** |
 | 3 | DSFB endoduction (FuzzSemanticBank, precedents, probes) | **DONE** |
 | 4 | FRF courts (real receipts at promotion) + Gemel durable boundaries + revision tape replay | **DONE** |
-| 5-8 | AVX2 hardening, database specialization, GPU, scientific evaluation | planned |
+| 5 | AVX2 hardening: measured per-window scan/clear + cmp snapshot wired through runtime-dispatched SIMD; per-execution event-window allocation removed (`examples/phase5_bench`); scalar == AVX2 property-tested | **DONE** |
+| 6-8 | Database specialization, GPU, scientific evaluation | planned |
 
 ## The two planes
 

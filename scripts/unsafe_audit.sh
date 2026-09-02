@@ -65,11 +65,16 @@ for f in $APPROVED; do
   fi
 done
 
-# 3. No keyword usage outside src/ except the documented asan_crash example.
+# 3. No keyword usage outside src/ except the documented FFI examples.
 for f in $(find . -name '*.rs' -not -path './target/*' -not -path './.phase0/*' | sort); do
   [ -f "$f" ] || continue
   case "$f" in
-    */examples/asan_crash.rs) continue ;;  # documented deliberate OOB demo
+    */examples/asan_crash.rs) continue ;;     # documented deliberate OOB demo
+    */examples/phase5_bench.rs) continue ;;   # benchmark mirrors worker.rs's
+                                              # single-symbol setitimer shim to
+                                              # measure the per-window timeout
+                                              # syscall cost (SAFETY comments
+                                              # in-file)
   esac
   case "$f" in
     ./src/*) continue ;;  # handled by checks 1-2

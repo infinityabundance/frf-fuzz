@@ -226,17 +226,33 @@ fn push(e: CmpEvent) {
 /// Runs after the execution window; comparisons are fine here. The snapshot's
 /// own pushed events land after the captured range and are discarded by the
 /// next reset.
+///
+/// The live region is contiguous except at the ring wrap; copying it as at
+/// most two contiguous segments (rather than one masked element at a time)
+/// lets the copy lower to a vectorized memcpy — measured as the largest
+/// fixed per-execution item after the coverage scan (Phase-5 bench).
 pub fn snapshot(out: &mut [CmpEvent]) -> usize {
     let head = load32(std::ptr::addr_of!(HEAD));
     let tail = load32(std::ptr::addr_of!(TAIL));
     let count = tail.wrapping_sub(head) as usize;
     let n = count.min(out.len());
-    for (i, slot) in out[..n].iter_mut().enumerate() {
-        let idx = (head.wrapping_add(i as u32) as usize) & (RING_LEN - 1);
-        // SAFETY: idx < RING_LEN by the mask; no concurrent producer (the
-        // worker freezes the ring before snapshotting).
-        unsafe {
-            *slot = std::ptr::addr_of!(RING).cast::<CmpEvent>().add(idx).read();
+    if n == 0 {
+        return 0;
+    }
+    let h = (head as usize) & (RING_LEN - 1);
+    let first = n.min(RING_LEN - h);
+    // SAFETY: `h < RING_LEN` by the power-of-two mask; `h + first <= RING_LEN`
+    // by `first`'s definition, so the first segment is inside `RING`. The
+    // live-region invariant (push keeps `tail - head <= RING_LEN`) bounds the
+    // live count by `RING_LEN`, so `n <= RING_LEN`; the second segment, when
+    // present, starts at index 0 and is `n - first < RING_LEN` events inside
+    // `RING`. `out` has `n <= out.len()` slots. No concurrent producer (the
+    // worker freezes the ring before snapshotting; module docs).
+    unsafe {
+        let ring = std::ptr::addr_of!(RING).cast::<CmpEvent>();
+        std::ptr::copy_nonoverlapping(ring.add(h), out.as_mut_ptr(), first);
+        if n > first {
+            std::ptr::copy_nonoverlapping(ring, out.as_mut_ptr().add(first), n - first);
         }
     }
     n
@@ -400,6 +416,81 @@ mod tests {
         let n = snapshot(&mut out);
         assert_eq!(n, 4);
         assert_eq!(out[0].a, 1); // event 0 dropped
+    }
+
+    /// Fill the ring storage with distinguishable events and drive HEAD/TAIL
+    /// directly so snapshot's two-segment contiguous copy is exercised across
+    /// every wrap alignment. Reference semantics (the invariant):
+    /// `out[i] == RING[(head + i) & (RING_LEN - 1)]` for `i < n`.
+    #[test]
+    fn snapshot_wrap_is_contiguous_and_ordered() {
+        let _g = LOCK.lock().unwrap();
+        // 1. A saturated ring whose head has advanced 1000 slots: the live
+        //    region spans the ring end, so snapshot MUST split the copy.
+        reset();
+        for i in 0..(RING_LEN as u64 + 1000) {
+            push_cmp8(i, 0);
+        }
+        assert!(overflowed());
+        let mut out = vec![CmpEvent::cmp(CmpKind::Cmp, 8, 0, 0); RING_LEN];
+        let n = snapshot(&mut out);
+        assert_eq!(n, RING_LEN);
+        // Live events are a == 1000..(RING_LEN + 1000), oldest first. Event
+        // with a == RING_LEN sits at ring index 0 (the second segment).
+        for (j, e) in out.iter().enumerate() {
+            assert_eq!(e.a, 1000 + j as u64, "order broken at out[{j}]");
+        }
+        assert_eq!(out[RING_LEN - 1000].a, RING_LEN as u64);
+
+        // 2. Randomized (head, tail) pairs over the full u32 space, including
+        //    u32 wraparound, all counts up to RING_LEN, and out buffers both
+        //    smaller than and equal to the live count. Reference loop below
+        //    IS the normative masked semantics.
+        let mut x = 0x243F_6A88_85A3_08D3u64;
+        let mut rng = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 16) as u32
+        };
+        // SAFETY: writes fill every slot of the static ring exactly once; the
+        // test holds the module LOCK so no other test/worker touches it.
+        unsafe {
+            let ring = std::ptr::addr_of_mut!(RING).cast::<CmpEvent>();
+            for i in 0..RING_LEN {
+                ring.add(i)
+                    .write(CmpEvent::cmp(CmpKind::Cmp, 8, i as u64, 0));
+            }
+        }
+        for _ in 0..512 {
+            let count = if rng() % 32 == 0 {
+                RING_LEN as u32 // rare saturated window
+            } else {
+                (rng() as usize % (RING_LEN + 1)) as u32
+            };
+            let head = rng(); // arbitrary, including u32 wraparound states
+                              // Direct state drive is safe: single-threaded under LOCK; the
+                              // module's store helpers perform the raw writes.
+            store32(std::ptr::addr_of_mut!(HEAD), head);
+            store32(std::ptr::addr_of_mut!(TAIL), head.wrapping_add(count));
+            let cap = if rng() % 3 == 0 {
+                count as usize
+            } else {
+                rng() as usize % (count as usize + 1)
+            };
+            let cap = cap.min(RING_LEN);
+            let mut out = vec![CmpEvent::cmp(CmpKind::Cmp, 8, 0, 0); cap];
+            let n = snapshot(&mut out);
+            assert_eq!(n, cap.min(count as usize));
+            // SAFETY: reads follow the live-region bound `count <= RING_LEN`
+            // established by the push discipline; index arithmetic is masked.
+            for (j, e) in out.iter().enumerate() {
+                let idx = (head.wrapping_add(j as u32) as usize) & (RING_LEN - 1);
+                let want = unsafe { (std::ptr::addr_of!(RING).cast::<CmpEvent>().add(idx)).read() };
+                assert_eq!(e.a, want.a, "wrap copy wrong at out[{j}] (head={head})");
+            }
+        }
+        reset();
     }
 
     #[test]

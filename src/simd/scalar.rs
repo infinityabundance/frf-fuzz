@@ -40,6 +40,37 @@ pub fn clear_nonzero(data: &mut [u8]) -> u32 {
     n
 }
 
+/// Scan-and-clear: write the byte offsets of every nonzero byte of `data`
+/// (OR-ed with `base`) into `out` in ascending offset order, and CLEAR every
+/// nonzero byte. All-zero bytes are left untouched (they are already zero).
+///
+/// This is the per-execution coverage consume operation (sancov
+/// `scan_and_clear`) expressed over one contiguous slice. Returns the number
+/// of offsets written and whether the output buffer saturated (a nonzero
+/// byte was seen after `out` filled; the data was STILL cleared — a consume
+/// never leaks into the next window). Saturation is reported, never silently
+/// truncated.
+///
+/// The scalar implementation is NORMATIVE; the AVX2 path must be bit-for-bit
+/// identical (docs/INVARIANTS.md, I3).
+pub fn scan_nonzero_clear(data: &mut [u8], base: u64, out: &mut [u64]) -> (u32, bool) {
+    let cap = out.len();
+    let mut n = 0usize;
+    let mut saturated = false;
+    for (j, c) in data.iter_mut().enumerate() {
+        if *c != 0 {
+            if n < cap {
+                out[n] = base | (j as u64);
+                n += 1;
+            } else {
+                saturated = true;
+            }
+            *c = 0;
+        }
+    }
+    (n as u32, saturated)
+}
+
 /// Count bits set in `cur` but not in `prev`.
 pub fn count_newly_set(prev: &[u8], cur: &[u8]) -> u32 {
     debug_assert_eq!(prev.len(), cur.len());

@@ -266,10 +266,66 @@ authority-less control campaigns record zero verifications. FRF courts add
 wall-clock time only at crash promotion (Level 2; seconds per court on this
 machine) — never in the per-execution loop.
 
-## Phase 5 — AVX2 Hardening
+## Phase 5 — AVX2 Hardening (DONE)
 
-- Profile the measured hot paths; optimize only measured bottlenecks; no
-  semantic changes (property tests stay green).
+- `examples/phase5_bench.rs` (`cargo run --release --example phase5_bench`):
+  a dependency-free per-execution attribution benchmark. It measures the
+  fixed worker costs (coverage scan+clear, cmp snapshot, signal/residual
+  machinery, mutations, feature sort, ledger echo, the setitimer arm/disarm
+  pair) and compares scalar vs AVX2 kernels. Sizes are grounded: the
+  golden-demo target registers 3529 coverage-counter bytes (1 range, read
+  from its worker HELLO); 64 KiB and 1 MiB bracket std-inclusive real
+  targets. Honest measurement discipline: timed closures re-arm outside the
+  clock, the snapshot's copy is forced materialized by an opaque consumer
+  (LLVM otherwise forwards it into direct ring reads), and the S2/S8 buffers
+  reuse preallocated storage.
+- New normative kernel `simd/scalar.rs::scan_nonzero_clear` + AVX2 twin
+  `x86_avx2.rs::scan_nonzero_clear_avx2` + runtime dispatch in `simd/mod.rs`:
+  the per-window coverage consume (record every nonzero counter's packed
+  `base | offset` in ascending order, CLEAR it, report `(written, saturated)`;
+  a saturated consume still clears — it never leaks into the next window).
+  The AVX2 path tests 32-byte chunks with one compare+movemask, skips
+  all-zero chunks without a store, records nonzero offsets bit-by-bit in
+  ascending order, then clears the chunk with one zero store.
+- `target_runtime/sancov.rs` now walks the registered counter ranges through
+  `simd::scan_nonzero_clear` (base = `range_index << 32`) and `simd::clear`;
+  `scan_and_clear` returns `u32::MAX` on saturation instead of truncating.
+  `target_runtime/cmp.rs::snapshot` copies the live ring as at most two
+  contiguous segments (a vectorized memcpy) instead of one masked element at
+  a time.
+- Worker hot-path allocation removal: the per-execution `to_vec` of the
+  saturated ~26 KiB cmp event window is gone. `WindowOutcome` carries
+  `n_events`; events live in the fixed `events_buf` and are wired only when a
+  discovery is pushed (the estimate and `wire_events` read `events_buf`
+  directly). Ordinary executions now allocate nothing for events.
+- Measured on this development machine (release; single runs, informational):
+  the coverage consume dropped from ~880 ns (scalar) to ~60 ns
+  (AVX2-dispatched) on the demo-size 3529-byte counter space, and from ~12 us
+  to ~600 ns at 64 KiB (sparse 40-edge window) — the dominant fixed item,
+  which had grown linearly with the counter space. `clear_all` was already
+  auto-vectorized (~11 ns at demo size). The cmp snapshot is ~185 ns with a
+  real materialized copy. Everything else is sub-100 ns scalar work: residual
+  deltas ~56 ns, sketch ~29 ns, mutations 25-55 ns, sort+dedup ~12 ns, ledger
+  echo ~2 ns, setitimer arm/disarm pair ~127 ns (measured — the timeout
+  discipline is NOT a bottleneck on this kernel). The demo-size fixed worker
+  floor is ~600 ns against a 15-25 us per-execution target+IPC+coordinator
+  budget.
+- Why Phase 5 stops here (documented in the bench's Interpretation trailer):
+  the remaining items are scalar per-byte decision work or 64-bit saturating
+  arithmetic (AVX2 has no 64-bit saturating subtract), each sub-100 ns;
+  retrofitting them with vector tricks would risk the scalar==AVX2 invariant
+  (I3) for near-zero measured gain. Mutations keep their per-execution
+  candidate `Vec` deliberately: the benchmark shows the copy of the parent is
+  the cost (unavoidable without in-place mutation, which would break parent
+  immutability) and the allocator churn is ~10 ns of a 30-55 ns mutation.
+- Verification: property tests assert scalar == AVX2 for every kernel over
+  randomized/adversarial/boundary inputs (`simd` suite), the new wrap
+  property test pins `cmp::snapshot` against the normative masked reference
+  over randomized `(head, tail)` pairs including u32 wraparound, and
+  `scripts/golden_demo.sh`/`examples/sancov_demo` re-run the instrumented
+  build to confirm the masked delta sets are unchanged after the SIMD wiring
+  (I3 regression). `scripts/unsafe_audit.sh` stays clean (unsafe confined to
+  the approved zones; every block has a `// SAFETY:` comment).
 
 ## Phase 6 — Database Specialization
 

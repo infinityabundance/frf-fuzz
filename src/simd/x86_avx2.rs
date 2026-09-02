@@ -383,6 +383,75 @@ pub unsafe fn mismatch_count_avx2(a: &[u8], b: &[u8]) -> u32 {
     total
 }
 
+/// Scan-and-clear with packed `u64` output (the per-execution coverage
+/// consume; see [`super::scalar::scan_nonzero_clear`] for the normative
+/// semantics).
+///
+/// 32-byte chunks are tested with one compare+movemask: an all-zero chunk is
+/// skipped without any store. A chunk with nonzero bytes is cleared with one
+/// vector store (zeroing the whole chunk is equivalent to zeroing only its
+/// nonzero bytes) after its nonzero offsets have been recorded in ascending
+/// order, preserving the scalar output order exactly.
+///
+/// # Safety
+///
+/// The caller must guarantee AVX2 availability (the public API gates on
+/// `is_x86_feature_detected!`) and in-bounds slices (tails are handled by
+/// the scalar loops below).
+#[target_feature(enable = "avx2")]
+pub unsafe fn scan_nonzero_clear_avx2(data: &mut [u8], base: u64, out: &mut [u64]) -> (u32, bool) {
+    let cap = out.len();
+    let mut n = 0usize;
+    let mut saturated = false;
+    let mut i = 0usize;
+    // SAFETY: 32-byte loads/stores only while `i + 32 <= data.len()`; the
+    // zero vector is a compile-time constant; the tail below is scalar.
+    while i + 32 <= data.len() {
+        let v = unsafe { _mm256_loadu_si256(data.as_ptr().add(i) as *const __m256i) };
+        let eq = unsafe { _mm256_cmpeq_epi8(v, _mm256_setzero_si256()) };
+        let mut mask = !unsafe { _mm256_movemask_epi8(eq) } as u32;
+        if mask != 0 {
+            // Record each nonzero offset in ascending order (bit 0 = byte
+            // i, bit 31 = byte i+31). Writes past `out` are refused; the
+            // data is still cleared below (a consume never leaks).
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                if n < cap {
+                    out[n] = base | ((i + bit) as u64);
+                    n += 1;
+                } else {
+                    saturated = true;
+                }
+                mask &= mask - 1;
+            }
+            // SAFETY: the chunk is fully inside `data` (loop guard); storing
+            // zeros over the whole chunk clears exactly the nonzero bytes
+            // (the zero bytes were already zero) — identical final state to
+            // the scalar per-byte clear.
+            unsafe {
+                _mm256_storeu_si256(
+                    data.as_mut_ptr().add(i) as *mut __m256i,
+                    _mm256_setzero_si256(),
+                );
+            }
+        }
+        i += 32;
+    }
+    let tail_start = i;
+    for (k, c) in data[tail_start..].iter_mut().enumerate() {
+        if *c != 0 {
+            if n < cap {
+                out[n] = base | ((tail_start + k) as u64);
+                n += 1;
+            } else {
+                saturated = true;
+            }
+            *c = 0;
+        }
+    }
+    (n as u32, saturated)
+}
+
 /// Coarse presence mask: `out[i]` bit `j` is set iff any byte in mini-chunk
 /// `i*64 + j` (8 bytes each) is nonzero.
 ///

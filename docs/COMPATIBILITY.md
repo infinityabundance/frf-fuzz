@@ -269,3 +269,29 @@ the single-threaded worker discipline (portable), not on x86 atomicity
   FRF's runner identity is the hash of the embedding executable, so the
   same court observed by two different coordinator builds yields two valid
   evidence chains. Idempotent convergence holds within one binary (tested).
+
+## 10. Phase-5 integration notes (AVX2 hardening)
+
+* The per-execution coverage consume (`sancov::scan_and_clear` + `clear_all`)
+  and the cmp ring snapshot (`cmp::snapshot`) now dispatch through the SIMD
+  kernels; scalar remains normative (I3) and the property tests assert
+  bit-for-bit equality, so an AVX2-disabled CPU observes identical feature
+  sets, orderings, and saturation behavior. No instrumented-build flag
+  changes were needed: these functions run outside the target window (their
+  own edges/events are wiped or land after the captured range), so the
+  icmp-free callback discipline is untouched.
+* `cmp::snapshot` reads the ring through `copy_nonoverlapping` segments. The
+  safety argument is the single-producer discipline plus the power-of-two
+  mask: the live region is contiguous except at the RING_LEN wrap, and the
+  push discipline keeps the live count <= RING_LEN, so the two segments are
+  always inside the array. `snapshot` runs after the window (comparisons are
+  fine); it never runs inside a callback.
+* The worker keeps cmp events in a fixed `[CmpEvent; 256]` buffer across
+  windows; only discovery pushes materialize them. Anything that reads
+  `events_buf` must do so before the next window overwrites it (the current
+  call sites are `window_with`'s hit extraction and `push_discovery`, both in
+  the same loop iteration as the snapshot).
+* Phase 5 changed no semantics and no stable record formats: feature packed
+  indices, cmp wire encoding, mutation coordinates, and object layouts are
+  untouched. The 0.5.0 release is drop-in compatible with 0.4.x stores and
+  tapes.

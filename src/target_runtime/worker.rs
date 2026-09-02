@@ -368,11 +368,17 @@ struct Worker {
 }
 
 /// One executed window's observation (worker-internal).
+///
+/// Cmp events deliberately do NOT live here: they are snapshotted into the
+/// worker's fixed `events_buf` and materialized only when a discovery is
+/// pushed (Phase-5 finding: a per-execution `to_vec` of the saturated ~26 KiB
+/// event window was a heap allocation + copy on EVERY execution, violating
+/// the performance contract; ordinary executions must stay allocation-free).
 struct WindowOutcome {
     /// Footprint-masked, sorted, deduplicated feature set.
     features: Vec<u64>,
-    /// Target cmp events (already separated from the scan by ordering).
-    events: Vec<CmpEvent>,
+    /// Number of live cmp events in `Worker::events_buf` after the window.
+    n_events: usize,
     /// The observed signal vector (Phase 2).
     signals: SignalVector,
     /// Execution time bucket (logarithmic).
@@ -610,9 +616,12 @@ impl Worker {
         let dt_ms = t0.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
         // 4. Snapshot the ring BEFORE the scan: the captured range is
         //    exactly the target's events (the scan's own events land after
-        //    and are discarded by the next reset).
+        //    and are discarded by the next reset). The events stay in the
+        //    fixed buffer; they are copied only if this window is pushed as
+        //    a discovery (push_discovery) — ordinary executions allocate
+        //    nothing here (Phase 5).
         let n_events = cmp::snapshot(&mut self.events_buf);
-        let events: Vec<CmpEvent> = self.events_buf[..n_events.min(self.events_buf.len())].to_vec();
+        let n_events = n_events.min(self.events_buf.len());
         // 5. Scan (clears). Saturating return is impossible here: the scan
         //    buffer has one slot per counter byte.
         let n = sancov::scan_and_clear(&mut self.scan_buf);
@@ -626,16 +635,19 @@ impl Worker {
         features.sort_unstable();
         features.dedup();
         // 7. Remember cmp hits for cmp-guided substitution in the NEXT
-        //    mutation (bounded).
+        //    mutation (bounded). Reads the fixed buffer directly (no copy).
         self.last_cmp_hits.clear();
-        for e in events.iter().take(MAX_CMP_EVENTS_PER_EXEC) {
+        for e in self.events_buf[..n_events]
+            .iter()
+            .take(MAX_CMP_EVENTS_PER_EXEC)
+        {
             if let Some(hit) = event_to_hit(e) {
                 self.last_cmp_hits.push(hit);
             }
         }
         Ok(WindowOutcome {
             features,
-            events,
+            n_events,
             signals,
             time_bucket: time_bucket(dt_ms),
         })
@@ -703,7 +715,7 @@ impl Worker {
             + 4
             + outcome.features.len() * 8
             + 2
-            + outcome.events.len().min(MAX_CMP_EVENTS_PER_EXEC) * 17
+            + outcome.n_events.min(MAX_CMP_EVENTS_PER_EXEC) * 17
             + 2
             + hits_used.len() * 9
             + 520
@@ -714,11 +726,17 @@ impl Worker {
             return Ok(());
         }
         *result_bytes += estimate;
+        // The events themselves live in `events_buf` (window_with snapshots
+        // them there); wire them from the buffer, capped at the wire bound.
+        // Between the snapshot and this call only THIS window ran, so the
+        // buffer still holds exactly this window's events.
+        let n = outcome.n_events.min(self.events_buf.len());
+        let cmp_events = wire_events(&self.events_buf[..n]);
         result.discoveries.push(DiscoveryRecord {
             coordinate: coord,
             status: ExecutionStatus::Ok,
             features: outcome.features,
-            cmp_events: wire_events(&outcome.events),
+            cmp_events,
             cmp_hits_used: hits_used,
             signals: outcome.signals,
             sketch,

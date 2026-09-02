@@ -88,6 +88,25 @@ pub fn clear_nonzero(data: &mut [u8]) -> u32 {
     scalar::clear_nonzero(data)
 }
 
+/// Scan-and-clear with packed `u64` output (the per-execution coverage
+/// consume; normative semantics in [`scalar::scan_nonzero_clear`]).
+///
+/// Returns `(written, saturated)`: the number of packed indices written
+/// (each `base | byte_offset`, ascending) and whether a nonzero byte was
+/// seen after `out` filled (the data was STILL cleared).
+pub fn scan_nonzero_clear(data: &mut [u8], base: u64, out: &mut [u64]) -> (u32, bool) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: guarded by runtime detection; reads/writes exactly
+        // `data.len()` bytes and writes at most `out.len()` entries (an
+        // overflowing entry sets `saturated`, exactly like the scalar path).
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { x86_avx2::scan_nonzero_clear_avx2(data, base, out) };
+        }
+    }
+    scalar::scan_nonzero_clear(data, base, out)
+}
+
 /// Count bits set in `cur` but not in `prev` (novelty of a bitmap).
 pub fn count_newly_set(prev: &[u8], cur: &[u8]) -> Result<u32> {
     check_same_len(prev, cur)?;
@@ -428,6 +447,101 @@ mod tests {
             #[cfg(not(target_arch = "x86_64"))]
             scalar::chunk_present_mask(&data, &mut o2);
             assert_eq!(o1, o2, "chunk_present_mask len={len}");
+        }
+    }
+
+    #[test]
+    fn scalar_matches_avx2_scan_nonzero_clear() {
+        // The per-execution coverage consume: scalar (normative) vs AVX2 must
+        // be identical in reported indices, saturation, AND cleared data.
+        #[cfg(target_arch = "x86_64")]
+        if !avx2_available() {
+            return;
+        }
+        let bases = [0u64, 1u64 << 32, (3u64 << 32) | 0xFFFF, u64::MAX >> 1];
+        for len in sizes() {
+            for (seed, base) in [
+                (0u64, bases[0]),
+                (1, bases[1]),
+                (0xDEAD, bases[2]),
+                (0xBEEF, bases[3]),
+            ] {
+                let src = pattern_bytes(seed, len);
+                // Output caps: full, half, a single slot, and none (saturation
+                // paths).
+                for cap in [len, len / 2 + 1, 1, 0] {
+                    let mut d1 = src.clone();
+                    let mut d2 = src.clone();
+                    let mut o1 = vec![u64::MAX; cap];
+                    let mut o2 = vec![u64::MAX; cap];
+                    let r1 = scalar::scan_nonzero_clear(&mut d1, base, &mut o1);
+                    #[cfg(target_arch = "x86_64")]
+                    let r2 = unsafe { x86_avx2::scan_nonzero_clear_avx2(&mut d2, base, &mut o2) };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let r2 = scalar::scan_nonzero_clear(&mut d2, base, &mut o2);
+                    assert_eq!(
+                        r1, r2,
+                        "scan_nonzero_clear result len={len} cap={cap} seed={seed:#x}"
+                    );
+                    assert_eq!(o1, o2, "scan_nonzero_clear out len={len} cap={cap}");
+                    assert_eq!(
+                        d1, d2,
+                        "scan_nonzero_clear cleared data len={len} cap={cap}"
+                    );
+                    // Data really is cleared (the consume never leaks).
+                    assert!(d1.iter().all(|b| *b == 0), "data not cleared len={len}");
+                }
+            }
+            // Adversarial patterns at every boundary size.
+            for data in [
+                vec![0u8; len],
+                vec![0xFFu8; len],
+                (0..len)
+                    .map(|i| if i % 2 == 0 { 0x80 } else { 0 })
+                    .collect(),
+                {
+                    let mut v = vec![0u8; len];
+                    if !v.is_empty() {
+                        v[0] = 1;
+                        v[len - 1] = 2;
+                    }
+                    v
+                },
+            ] {
+                let base = 7u64 << 32;
+                let mut d1 = data.clone();
+                let mut d2 = data.clone();
+                let mut o1 = vec![0u64; len + 1];
+                let mut o2 = vec![0u64; len + 1];
+                let r1 = scalar::scan_nonzero_clear(&mut d1, base, &mut o1);
+                #[cfg(target_arch = "x86_64")]
+                let r2 = unsafe { x86_avx2::scan_nonzero_clear_avx2(&mut d2, base, &mut o2) };
+                #[cfg(not(target_arch = "x86_64"))]
+                let r2 = scalar::scan_nonzero_clear(&mut d2, base, &mut o2);
+                assert_eq!(r1, r2, "adversarial scan_nonzero_clear len={len}");
+                assert_eq!(o1, o2);
+                assert_eq!(d1, d2);
+            }
+        }
+    }
+
+    #[test]
+    fn public_scan_nonzero_clear_dispatch_is_consistent() {
+        // The public wrapper must equal the scalar reference on every path.
+        for len in sizes() {
+            for seed in [0x1234u64, 0xFFFF_0000_FFFF_0000] {
+                let src = pattern_bytes(seed, len);
+                let mut d1 = src.clone();
+                let mut d2 = src.clone();
+                let cap = len / 3 + 1;
+                let mut o1 = vec![0u64; cap];
+                let mut o2 = vec![0u64; cap];
+                let r1 = scalar::scan_nonzero_clear(&mut d1, 0xABCD << 32, &mut o1);
+                let r2 = scan_nonzero_clear(&mut d2, 0xABCD << 32, &mut o2);
+                assert_eq!(r1, r2, "public dispatch result len={len}");
+                assert_eq!(o1, o2);
+                assert_eq!(d1, d2);
+            }
         }
     }
 

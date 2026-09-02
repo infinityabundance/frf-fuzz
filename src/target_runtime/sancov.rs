@@ -301,20 +301,16 @@ pub fn total_counter_bytes() -> usize {
 /// pointers must not trigger shadow checks (which would recurse).
 pub fn clear_all() {
     // SAFETY: every registered range is a live, valid array (registration
-    // contract); we write exactly `len` bytes of each.
-    //
-    // Index loop (not an iterator): the registry is a `static mut`; the
-    // iterator forms either copy the whole array per call (1 KiB of waste in
-    // the hot path) or need a reference into static-mut storage. This loop
-    // compiles to one 16-byte load per range.
+    // contract); the slice views cover exactly `len` bytes of each. The
+    // clear itself is the SIMD/vectorized kernel (32-byte chunk stores with
+    // a scalar tail), so the per-window wipe does not depend on the
+    // optimizer's willingness to vectorize a raw-pointer byte loop.
     #[allow(clippy::needless_range_loop)]
     unsafe {
         for i in 0..RANGE_COUNT {
             let r = RANGES[i];
-            for j in 0..r.len {
-                let c = r.start.add(j) as *mut u8;
-                *c = 0;
-            }
+            let slice = std::slice::from_raw_parts_mut(r.start as *mut u8, r.len);
+            crate::simd::clear(slice);
         }
     }
 }
@@ -337,31 +333,23 @@ pub fn clear_all() {
 /// instrumented target build: raw counter reads must not trigger shadow
 /// checks.
 pub fn scan_and_clear(out: &mut [u64]) -> u32 {
-    let cap = out.len();
     let mut n = 0usize;
     let mut saturated = false;
     // SAFETY: every registered range is a live, valid array (registration
-    // contract); reads/writes are exactly `len` bytes each. `out` is a
-    // caller-owned slice; writes are guarded by `n < cap`.
-    //
-    // Index loop (not an iterator): see `clear_all` — the registry is a
-    // `static mut` and the iterator forms are worse in the hot path.
+    // contract); the slice views cover exactly `len` bytes of each. Writes
+    // to `out` are contiguous across ranges (ascending range index, then
+    // ascending offset) and guarded by the remaining capacity; the SIMD
+    // kernel reports saturation when a nonzero byte is seen after `out`
+    // filled — the data is STILL cleared (a consume never leaks).
     #[allow(clippy::needless_range_loop)]
     unsafe {
         for i in 0..RANGE_COUNT {
             let r = RANGES[i];
-            for j in 0..r.len {
-                let c = r.start.add(j) as *mut u8;
-                if *c != 0 {
-                    if n < cap {
-                        out[n] = ((i as u64) << 32) | (j as u64);
-                        n += 1;
-                    } else {
-                        saturated = true;
-                    }
-                    *c = 0;
-                }
-            }
+            let slice = std::slice::from_raw_parts_mut(r.start as *mut u8, r.len);
+            let (written, sat) =
+                crate::simd::scan_nonzero_clear(slice, (i as u64) << 32, &mut out[n..]);
+            n = n.saturating_add(written as usize);
+            saturated |= sat;
         }
     }
     if saturated {

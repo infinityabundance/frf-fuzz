@@ -245,11 +245,49 @@ deferred until a measured implementation exists; never stack unwinding).
 
 `simd/` provides coverage-scan, novelty-bitmap, mismatch, popcount, chunk-
 presence and signature operations. Scalar implementations are normative
-(`simd/scalar.rs`); AVX2 (`simd/x86_avx2.rs`) is runtime-dispatched via
-`is_x86_feature_detected!` and must be bit-for-bit identical. Property tests
-cover randomized, adversarial, and boundary sizes; the byte-popcount uses the
-AVX2 nibble-lookup trick (bit-level semantics matched to scalar). Unsafe is
-confined to the approved zones (see `INVARIANTS.md`).
+(`simd/scalar.rs`, which stays unsafe-free); AVX2 (`simd/x86_avx2.rs`) is
+runtime-dispatched via `is_x86_feature_detected!` and must be bit-for-bit
+identical (property tests cover randomized, adversarial, and boundary sizes;
+the byte-popcount uses the AVX2 nibble-lookup trick, bit-level semantics
+matched to scalar). Unsafe is confined to the approved zones (see
+`INVARIANTS.md`).
+
+Phase 5 wired the three measured per-window costs through these kernels:
+
+* `scan_nonzero_clear` (`simd/{scalar,x86_avx2,mod}.rs`) is the per-execution
+  coverage consume expressed over one contiguous slice: it records the packed
+  `base | byte_offset` of every nonzero counter into the output (ascending
+  order) and CLEARS it, reporting `(written, saturated)` — a saturated
+  consume still clears everything, so a report overflow never leaks into the
+  next window. `target_runtime/sancov.rs::scan_and_clear` walks the registered
+  counter ranges and feeds each range slice to the dispatched kernel with
+  `base = range_index << 32`; `clear_all` likewise dispatches `simd::clear`
+  per range (LLVM already auto-vectorized the old byte loop, so clearing was
+  never the bottleneck — the scan was: ~880 ns -> ~60 ns scalar vs AVX2 on
+  the demo-size 3529-byte counter space). The kernel returns saturation
+  (`u32::MAX`) instead of truncating silently.
+* `cmp::snapshot` copies the live ring region as at most two contiguous
+  segments (head/tail are power-of-two masked; the live count is <= RING_LEN
+  by the push discipline) instead of one masked element at a time, so the
+  copy lowers to a vectorized memcpy (~226 ns -> ~185 ns measured with a real
+  materialized copy; the masked loop could not vectorize across the wrap).
+  The wrap correctness is property-tested against the normative masked
+  reference over randomized (head, tail) pairs covering u32 wraparound.
+* The worker no longer heap-copies the cmp event window on every execution:
+  `window_with` snapshots into the fixed `events_buf` and records
+  `n_events`; the events are wired into a discovery only when one is pushed.
+  Previously every execution paid a `to_vec` of the saturated ~26 KiB event
+  window (a per-execution allocation + copy, violating the performance
+  contract); ordinary executions now allocate nothing for events.
+
+The remaining per-execution items (residual deltas ~56 ns, sketch ~29 ns,
+mutations 25-55 ns, feature sort ~12 ns, ledger echo ~2 ns, setitimer
+arm/disarm pair ~127 ns on this kernel) are scalar by nature — the deltas
+are 64-bit saturating arithmetic and AVX2 has no 64-bit saturating
+subtract — and sub-100 ns each, so Phase 5 stops at the measured items
+(`examples/phase5_bench`, `cargo run --release --example phase5_bench`).
+The demo-size fixed worker floor is ~600 ns against a 15-25 us per-execution
+target+IPC+coordinator budget.
 
 ## 11. Observation frame and residuals
 

@@ -210,7 +210,10 @@ enforced by `#![deny(unsafe_code)]` at the crate root with narrow
 Every unsafe block carries a `// SAFETY:` comment stating the exact
 invariant. `#![deny(unsafe_op_in_unsafe_fn)]` is enabled crate-wide.
 `scripts/unsafe_audit.sh` fails CI when a new unsafe location appears outside
-the approved modules.
+the approved modules. Two examples are documented exceptions outside `src/`:
+`examples/asan_crash.rs` (deliberate OOB demo) and
+`examples/phase5_bench.rs` (mirrors the worker's single-symbol `setitimer`
+shim to measure the per-window timeout syscall cost).
 
 ## Determinism notes
 
