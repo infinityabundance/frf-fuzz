@@ -47,7 +47,7 @@
 // attribute, used to make the measurement runtime ASan-exempt (see
 // target_runtime::cmp module docs: an ASan-instrumented comparison callback
 // recurses infinitely on LLVM >= 18). The coordinator build never enables
-// this feature, keeping MSRV 1.85 stable.
+// this feature.
 
 // ---------------------------------------------------------------------------
 // Module tree. Ungated modules are shared by both planes and must stay
@@ -77,6 +77,9 @@ pub mod observe;
 pub mod dsfb;
 
 #[cfg(feature = "coordinator")]
+pub mod precedent;
+
+#[cfg(feature = "coordinator")]
 pub mod store;
 
 #[cfg(feature = "coordinator")]
@@ -93,10 +96,11 @@ pub mod cli;
 
 /// The pinned nightly toolchain for instrumented fuzz-target builds.
 ///
-/// The coordinator itself compiles on stable Rust >= 1.85; only the
-/// instrumented target build requires nightly (LLVM SanitizerCoverage +
-/// sanitizer flags). `frf-fuzz doctor` verifies this exact toolchain and its
-/// rustc/LLVM identity; campaign metadata records the same identity.
+/// The coordinator itself compiles on stable Rust >= 1.98 (the declared
+/// MSRV); only the instrumented target build requires nightly (LLVM
+/// SanitizerCoverage + sanitizer flags). `frf-fuzz doctor` verifies this exact
+/// toolchain and its rustc/LLVM identity; campaign metadata records the same
+/// identity.
 ///
 /// Pinned in Phase 0 after empirical verification across every installed
 /// nightly (LLVM 20.1.1 .. 22.1.2): this is the newest installed toolchain on
@@ -118,4 +122,11 @@ pub const PINNED_NIGHTLY_LLVM: &str = "LLVM version: 22.1.2";
 pub const PINNED_NIGHTLY_COMMIT: &str = "66da6cae1a6f12e9585493ab8f8f19cf753091fd";
 
 /// The minimum supported Rust version for the coordinator build.
-pub const MSRV: &str = "1.85";
+///
+/// Raised from 1.85 to 1.98 (the current stable) by explicit user decision
+/// during Phase 3: the coordinator and target-runtime are written against the
+/// current stable toolchain, not an artificial older floor. The instrumented
+/// fuzz-target build remains pinned to [`DEFAULT_PINNED_NIGHTLY`] — that is a
+/// separate, recorded toolchain identity, never "whatever nightly is
+/// installed" (docs/COMPATIBILITY.md).
+pub const MSRV: &str = "1.98";

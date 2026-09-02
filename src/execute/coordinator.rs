@@ -22,6 +22,11 @@ use crate::canon::Family;
 use crate::corpus::admission::{decide as admission_decide, ResidualInput};
 use crate::corpus::entry::{self, AdmissionReason, CorpusMeta};
 use crate::corpus::CorpusIndex;
+use crate::dsfb::debug_bridge::{
+    encode_episode_payload, encode_verdict_payload, AxisVerdict, BridgeConfig, DurableVerdict,
+    EdgeStructural, LineageSubstrate, StructuralEpisode,
+};
+use crate::dsfb::fuzz_bank::{classify_evidence, role_of, AxisRole, BankEvidence, FuzzMotif};
 use crate::dsfb::morphology::{classify, LineageAccumulator, MorphologySignature};
 use crate::dsfb::regime::{RegimeConfig, RegimeEpisode, RegimeObserver};
 use crate::error::{Error, Result};
@@ -32,7 +37,14 @@ use crate::mutation::{CmpHit, CounterRng, MutationCoordinate, MutationInput};
 use crate::observe::residual::MutationResidual;
 use crate::observe::signals::encode_signal_schema;
 use crate::observe::sketch::{batch_drifts, drift_priority, state_buckets};
-use crate::scheduler::policy::{AmplifyEntry, OrderPlanner, SchedulePolicy, SchedulingClass};
+use crate::precedent::probe::{evaluate as eval_probe, ProbeOutcome};
+use crate::precedent::{
+    choose_precursor, create_from_terminal, load_current as load_precedents,
+    save_revision as save_precedent_revision, ConfuserKind, Precedent, PrefixProfile, TerminalKind,
+};
+use crate::scheduler::policy::{
+    AmplifyEntry, ClassAvail, OrderPlanner, ProbeEntry, SchedulePolicy, SchedulingClass,
+};
 use crate::scheduler::work_order::{self, ExecutionStatus, WorkOrder, WorkResult};
 use crate::store::refs;
 use crate::store::Store;
@@ -40,8 +52,10 @@ use crate::tape::model::{
     build_digest, encode_tape, environment_digest, RunTape, TapeLineage, TapeObservation,
     TapeSource, TerminationStatus,
 };
-use crate::target_runtime::signals::{ResidualSketch, SignalId, SignalVector};
-use std::collections::BTreeMap;
+use crate::target_runtime::signals::{
+    ResidualSketch, SignalId, SignalSchema, SignalVector, MAX_SIGNALS,
+};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -60,6 +74,19 @@ const MAX_AMPLIFY_ENTRIES: usize = 4096;
 /// One-shot freshness boost applied when an amplify frontier advances (the
 /// next batch's drift recomputes the priority, so the boost is ephemeral).
 const AMPLIFY_HOT_BOOST: u64 = 1 << 32;
+/// Hard cap on the live probe queue (bounded scheduling; §21).
+const MAX_PROBE_ENTRIES: usize = 256;
+/// Max precedent matches honored per admitted edge (a bounded match storm
+/// guard; only the most specific matches get probes).
+const MAX_MATCHES_PER_EDGE: usize = 2;
+/// How many structured signatures each lineage keeps for precedent
+/// creation (bounded memory; oldest dropped).
+const LINEAGE_HISTORY_CAP: usize = 8;
+/// Default probe recipe thresholds (the falsifiable relationship derived at
+/// precedent creation: the axis that historically drifted must keep moving
+/// across at least a quarter of the batch, with a persistent run).
+const PROBE_MIN_RUN: u8 = 4;
+const PROBE_MIN_BUCKET: u8 = 3;
 
 /// Campaign configuration.
 #[derive(Debug, Clone)]
@@ -123,6 +150,22 @@ pub struct CampaignSummary {
     pub tapes: u64,
     /// AMPLIFY orders dispatched.
     pub amplify_orders: u64,
+    /// Structural verdict objects persisted (Phase 3).
+    pub structural_verdicts: u64,
+    /// Structural episodes closed + persisted (Phase 3).
+    pub structural_episodes: u64,
+    /// Precedent revisions persisted (Phase 3).
+    pub precedent_revisions: u64,
+    /// Precedent families matched against live lineages.
+    pub precedent_matches: u64,
+    /// Probe orders dispatched.
+    pub probes_dispatched: u64,
+    /// Probe outcomes (Phase 3).
+    pub probe_supports: u64,
+    /// Probe contradictions recorded (negative knowledge).
+    pub probe_contradictions: u64,
+    /// Ambiguous probe outcomes.
+    pub probe_ambiguous: u64,
 }
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -146,7 +189,7 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
 
-/// The coordinator's durable-state bookkeeping (Phase 2).
+/// The coordinator's durable-state bookkeeping (Phase 2 + Phase 3).
 struct CampaignState {
     cfg: CampaignConfig,
     /// Global (signal, value-bucket) state-feature set (bounded).
@@ -159,15 +202,36 @@ struct CampaignState {
     lineages: BTreeMap<(ContentId, u16), LineageState>,
     /// Live amplify queue: (frontier, mutator) -> entry.
     amplify: BTreeMap<(ContentId, u16), AmplifyEntry>,
+    /// The precedent bank: current revisions keyed by (root, mutator,
+    /// profile identity) (Phase 3).
+    precedents: BTreeMap<(ContentId, u16, u64), (ContentId, Precedent)>,
+    /// The live probe queue: seq -> probe order (Phase 3).
+    probes: BTreeMap<u64, ProbeEntry>,
+    /// Deterministic probe ordinal counter.
+    probe_seq: u64,
+    /// Probes currently executing: (precedent revision id, matched root).
+    probe_inflight: std::collections::BTreeSet<(ContentId, ContentId)>,
     /// Global admission sequence (checkpointed).
     admission_seq: u64,
     /// The regime configuration (campaign-constant).
     regime_cfg: RegimeConfig,
+    /// The DSFB bridge configuration (campaign-constant; Phase 3).
+    bridge_cfg: BridgeConfig,
+    /// Per-axis declared roles (filled from the target schema; Phase 3).
+    roles: [AxisRole; MAX_SIGNALS],
     /// Counters.
     closed_episodes: u64,
     boundaries: u64,
     tapes: u64,
     amplify_orders: u64,
+    structural_verdicts: u64,
+    structural_episodes: u64,
+    precedent_revisions: u64,
+    precedent_matches: u64,
+    probes_dispatched: u64,
+    probe_supports: u64,
+    probe_contradictions: u64,
+    probe_ambiguous: u64,
     /// Schema digest already stored (content-addressed; ref recorded).
     schema_ref: Option<ContentId>,
     /// The target's signal schema (for inspection names).
@@ -179,9 +243,21 @@ struct CampaignState {
 
 /// One lineage's coordinator-side state.
 struct LineageState {
+    /// The lineage root entry (identity).
+    root: ContentId,
     acc: LineageAccumulator,
     /// Per-signal regime observers (created lazily on first movement).
     observers: BTreeMap<u16, RegimeObserver>,
+    /// The DSFB structural substrate (created lazily once the lineage shows
+    /// structure; Phase 3).
+    substrate: Option<LineageSubstrate>,
+    /// Bounded structured-signature history for precedent creation
+    /// (oldest first; Phase 3).
+    shape_history: VecDeque<(u32, MorphologySignature)>,
+    /// The bank nomination of the latest edge (0 = none).
+    last_class: u8,
+    /// The latest edge's structural verdict summary (for continuation data).
+    last_verdict_axis: Option<u16>,
     /// The frontier entry (latest admitted descendant).
     frontier: ContentId,
     /// Edge counter (regime ordinal; deterministic).
@@ -189,12 +265,65 @@ struct LineageState {
 }
 
 impl LineageState {
-    fn new() -> LineageState {
+    fn new(root: ContentId) -> LineageState {
         LineageState {
+            root,
             acc: LineageAccumulator::new(),
             observers: BTreeMap::new(),
+            substrate: None,
+            shape_history: VecDeque::new(),
+            last_class: 0,
+            last_verdict_axis: None,
             frontier: ContentId::new(b""),
             ordinal: 0,
+        }
+    }
+
+    /// Feed one admitted edge through the DSFB structural substrate,
+    /// creating the substrate on demand (only lineages that show structure
+    /// pay the substrate's memory). Deterministic; returns the edge's
+    /// structural summary and the closed structural episode when this edge
+    /// completed one.
+    fn feed_structural(
+        &mut self,
+        mutator: u16,
+        edge: &MutationResidual,
+        generation: u32,
+        bridge: &BridgeConfig,
+    ) -> Result<(EdgeStructural, Option<StructuralEpisode>)> {
+        if self.substrate.is_none() {
+            if edge.moved() == 0 {
+                // Nothing structural can come from a fully trivial edge.
+                return Ok((
+                    EdgeStructural {
+                        verdicts: Vec::new(),
+                        any_active: false,
+                    },
+                    None,
+                ));
+            }
+            self.substrate = Some(LineageSubstrate::new(self.root, mutator, bridge)?);
+        }
+        let sub = self.substrate.as_mut().expect("substrate just created");
+        sub.feed_edge(self.ordinal, edge, generation)
+    }
+
+    /// Record a structured signature in the bounded creation history.
+    fn push_history(&mut self, depth: u32, sig: &MorphologySignature) {
+        if sig.is_trivial() {
+            return;
+        }
+        self.shape_history.push_back((depth, sig.clone()));
+        if self.shape_history.len() > LINEAGE_HISTORY_CAP {
+            self.shape_history.pop_front();
+        }
+    }
+
+    /// Record the latest bank nomination and its dominant axis.
+    fn record_nomination(&mut self, class: u8, verdicts: &[AxisVerdict]) {
+        self.last_class = class;
+        if let Some(v) = verdicts.iter().max_by_key(|v| v.policy) {
+            self.last_verdict_axis = Some(v.axis);
         }
     }
 }
@@ -207,12 +336,26 @@ impl CampaignState {
             morph_identities: std::collections::BTreeSet::new(),
             lineages: BTreeMap::new(),
             amplify: BTreeMap::new(),
+            precedents: BTreeMap::new(),
+            probes: BTreeMap::new(),
+            probe_seq: 0,
+            probe_inflight: std::collections::BTreeSet::new(),
             admission_seq: 0,
             regime_cfg: RegimeConfig::default_config(),
+            bridge_cfg: BridgeConfig::default_config(),
+            roles: [AxisRole::NONE; MAX_SIGNALS],
             closed_episodes: 0,
             boundaries: 0,
             tapes: 0,
             amplify_orders: 0,
+            structural_verdicts: 0,
+            structural_episodes: 0,
+            precedent_revisions: 0,
+            precedent_matches: 0,
+            probes_dispatched: 0,
+            probe_supports: 0,
+            probe_contradictions: 0,
+            probe_ambiguous: 0,
             schema_ref: None,
             schema: None,
             build: build_digest(
@@ -230,6 +373,40 @@ impl CampaignState {
         }
     }
 
+    /// Load the durable precedent bank (Phase 3). Only the current revision
+    /// of each family is held in memory; older revisions stay stored.
+    fn load_bank(&mut self, store: &Store) -> Result<()> {
+        if !self.cfg.policy.residual || !self.cfg.policy.precedent {
+            return Ok(());
+        }
+        // Resolve the object id of each current revision by re-encoding
+        // (content addressing is deterministic, so the id of a decoded
+        // revision is recomputable).
+        for p in load_precedents(store)? {
+            let payload = crate::precedent::encode_precedent(&p)?;
+            let framed = crate::canon::frame(
+                Family::Precedent,
+                crate::canon::MAJOR,
+                crate::canon::MINOR,
+                &payload,
+            )?;
+            let id = ContentId::new(&framed);
+            let key = p.group_key();
+            self.precedents.insert(key, (id, p));
+        }
+        Ok(())
+    }
+
+    /// Fill the per-axis role table from the target's registered schema
+    /// (Phase 3). Axes without a schema keep [`AxisRole::NONE`].
+    fn fill_roles(&mut self, schema: &SignalSchema) {
+        for (id, desc) in schema.iter() {
+            if let Some(slot) = self.roles.get_mut(id.id() as usize) {
+                *slot = role_of(desc);
+            }
+        }
+    }
+
     /// The seed ancestor of an entry (deterministic walk; no cache — the
     /// walk is O(depth) and lineages are shallow).
     fn root_of(&self, index: &CorpusIndex, id: &ContentId) -> Option<ContentId> {
@@ -238,7 +415,9 @@ impl CampaignState {
 
     /// Rebuild all derived state from the durable corpus (deterministic
     /// replay in admission order; verifies stored morphology IDs — a
-    /// mismatch is corruption, I13).
+    /// mismatch is corruption, I13). The DSFB substrate and precedent
+    /// history are re-derived in memory so a resumed campaign continues
+    /// from the same structural state; nothing new is persisted here.
     fn rebuild(&mut self, store: &Store, index: &CorpusIndex) -> Result<()> {
         for meta in index.by_admission_order() {
             self.admission_seq = self.admission_seq.max(meta.admission_seq.saturating_add(1));
@@ -258,8 +437,9 @@ impl CampaignState {
                 .map(|m| m.signals.clone())
                 .unwrap_or_default();
             let edge = MutationResidual::of(&meta.signals, &parent_signals);
+            let bridge = self.bridge_cfg;
             let ls = self.lineages.entry(key).or_insert_with(|| {
-                let mut ls = LineageState::new();
+                let mut ls = LineageState::new(root);
                 if let Some(root_meta) = index.meta(&root) {
                     ls.acc.init_baseline(&root_meta.signals);
                 }
@@ -295,6 +475,16 @@ impl CampaignState {
                         closed.push((i as u16, ep));
                     }
                 }
+            }
+            // Phase 3: re-derive the substrate + history in memory. The
+            // returned verdicts/episodes are dropped (their durable objects
+            // were written when the admissions originally happened); only
+            // the machine state must be identical for the resume.
+            if !morph.is_trivial() {
+                ls.push_history(meta.generation, &morph);
+            }
+            if self.cfg.policy.residual {
+                let _ = ls.feed_structural(mutator, &edge, meta.generation, &bridge)?;
             }
             for (signal, ep) in closed {
                 self.write_episode(store, signal, ep)?;
@@ -375,8 +565,12 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
             let schema = work_order::wire_to_schema(&w.hello.schema)?;
             let id = state.store_schema(&store, &schema)?;
             refs::set_ref(&cfg.store_root, "signal-schema-current", &id)?;
+            state.fill_roles(&schema);
         }
     }
+
+    // ---- load the durable precedent bank (Phase 3) ----
+    state.load_bank(&store)?;
 
     // ---- rebuild derived state from the durable corpus ----
     state.rebuild(&store, &index)?;
@@ -432,9 +626,22 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
                 [executions as u32, (executions >> 32) as u32, lane as u32, 0],
                 [cfg.policy.seed as u32, (cfg.policy.seed >> 32) as u32],
             );
-            // Scheduling class: EXPLORE vs AMPLIFY (WRR, deterministic).
-            let class = planner.pick_class(!state.amplify.is_empty());
+            // Scheduling class: EXPLORE / AMPLIFY / DISCRIMINATE / FALSIFY
+            // (WRR, deterministic over the currently available classes).
+            let avail = ClassAvail {
+                amplify: !state.amplify.is_empty(),
+                discriminate: state
+                    .probes
+                    .values()
+                    .any(|e| e.class == SchedulingClass::Discriminate),
+                falsify: state
+                    .probes
+                    .values()
+                    .any(|e| e.class == SchedulingClass::Falsify),
+            };
+            let class = planner.pick_class(&avail);
             let mut is_amplify = false;
+            let mut probe_entry: Option<ProbeEntry> = None;
             let (parent_id, plan) = if class == SchedulingClass::Amplify {
                 // Highest-priority drifting lineage (ties: lowest key).
                 let entry = state
@@ -458,6 +665,35 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
                 state.amplify_orders = state.amplify_orders.saturating_add(1);
                 is_amplify = true;
                 (entry.parent, plan)
+            } else if class == SchedulingClass::Discriminate || class == SchedulingClass::Falsify {
+                // The earliest-queued probe of the picked class (deterministic
+                // FIFO by queue key).
+                let entry = state
+                    .probes
+                    .iter()
+                    .find(|(_, e)| e.class == class)
+                    .map(|(seq, e)| (*seq, e.clone()));
+                let Some((seq, entry)) = entry else {
+                    break 'outer; // queue drained between pick and use
+                };
+                state.probes.remove(&seq);
+                let parent_meta = index
+                    .meta(&entry.frontier)
+                    .expect("probe frontier must exist");
+                let start = *next_index.entry(parent_meta.entry_id.short()).or_insert(0);
+                let plan = planner.plan_probe(
+                    lane,
+                    &entry,
+                    parent_meta.generation.saturating_add(1),
+                    start,
+                    entry.seq,
+                );
+                state.probes_dispatched = state.probes_dispatched.saturating_add(1);
+                state
+                    .probe_inflight
+                    .insert((entry.precedent_id, entry.root));
+                probe_entry = Some(entry);
+                (probe_entry.as_ref().unwrap().frontier, plan)
             } else {
                 let Some(parent_id) = index.pick_parent(&mut rng) else {
                     break 'outer; // no corpus
@@ -510,6 +746,7 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
                 parent_generation: parent_meta.generation,
                 is_override: false,
                 is_amplify,
+                probe: probe_entry,
             };
             w.send_order(&order)?;
             pending.insert(lane, pend);
@@ -530,6 +767,7 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
                     Some(WorkerEvent::Frame(payload)) => {
                         if let Some(pend) = pending.remove(&lane) {
                             let result = work_order::decode_work_result(&payload)?;
+                            let probe = pend.probe.clone();
                             let (_admitted, new_deltas) = process_result(
                                 &store,
                                 &mut index,
@@ -540,6 +778,12 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
                                 &mut dict_const_count,
                                 &mut state,
                             )?;
+                            // Phase 3: a probe order's batch result is
+                            // evaluated against the precedent's falsifiable
+                            // relationship.
+                            if let Some(entry) = &probe {
+                                record_probe_result(&store, &mut state, entry, &result)?;
+                            }
                             for f in new_deltas {
                                 if !deltas.contains(&f) {
                                     deltas.push(f);
@@ -549,13 +793,16 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
                             // Log progress periodically.
                             if executions % (cfg.policy.batch_size * 8) < cfg.policy.batch_size {
                                 eprintln!(
-                                    "[campaign] execs={} corpus={} features={} state={} morph={} episodes={} amplify={} findings={}",
+                                    "[campaign] execs={} corpus={} features={} state={} morph={} episodes={} verdicts={} precedents={} probes={} amplify={} findings={}",
                                     executions,
                                     index.len(),
                                     index.feature_count(),
                                     state.state_features.len(),
                                     state.morph_identities.len(),
                                     state.closed_episodes,
+                                    state.structural_verdicts,
+                                    state.precedents.len(),
+                                    state.probes_dispatched,
                                     state.amplify.len(),
                                     findings
                                 );
@@ -656,6 +903,14 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
         boundaries: state.boundaries,
         tapes: state.tapes,
         amplify_orders: state.amplify_orders,
+        structural_verdicts: state.structural_verdicts,
+        structural_episodes: state.structural_episodes,
+        precedent_revisions: state.precedent_revisions,
+        precedent_matches: state.precedent_matches,
+        probes_dispatched: state.probes_dispatched,
+        probe_supports: state.probe_supports,
+        probe_contradictions: state.probe_contradictions,
+        probe_ambiguous: state.probe_ambiguous,
     })
 }
 
@@ -677,6 +932,9 @@ struct PendingOrder {
     parent_generation: u32,
     is_override: bool,
     is_amplify: bool,
+    /// The probe relationship this order tests (Phase 3), when it was
+    /// dispatched from the probe queue.
+    probe: Option<ProbeEntry>,
 }
 
 /// Build an input-override order (seed / replay / tmin candidate).
@@ -964,13 +1222,14 @@ fn process_result(
         for (s, b) in state_buckets(&d.signals) {
             state.state_features.insert((s, b));
         }
+        let generation = pend.parent_generation + 1;
         let mut feat = d.features.clone();
         feat.sort_unstable();
         feat.dedup();
         let meta = CorpusMeta {
             entry_id,
             parent_id: Some(pend.parent_id),
-            generation: pend.parent_generation + 1,
+            generation,
             features: feat,
             reason: admission.reason,
             signals: d.signals.clone(),
@@ -989,37 +1248,111 @@ fn process_result(
             }
         }
 
-        // ---- lineage / regime / amplify updates ----
+        // ---- lineage / regime / amplify / DSFB updates ----
         let root = state
             .root_of(index, &pend.parent_id)
             .unwrap_or(pend.parent_id);
         let mutator = d.coordinate.mutator_id.id();
         let key = (root, mutator);
-        let ls = state.lineages.entry(key).or_insert_with(|| {
-            let mut ls = LineageState::new();
-            if let Some(root_meta) = index.meta(&root) {
-                ls.acc.init_baseline(&root_meta.signals);
-            }
-            ls
-        });
-        ls.frontier = entry_id;
-        ls.ordinal = ls.ordinal.saturating_add(1);
-        // Regime feeds on the moved axes. Episodes are collected and
-        // written after the observer loop (borrow discipline).
-        let mut closed: Vec<(u16, RegimeEpisode)> = Vec::new();
-        for i in 0..crate::target_runtime::signals::MAX_SIGNALS {
-            if edge.moved() & (1u64 << i) != 0 {
-                let obs = ls
-                    .observers
-                    .entry(i as u16)
-                    .or_insert_with(|| RegimeObserver::new(state.regime_cfg));
-                if let Some(ep) = obs.feed(ls.ordinal, edge.child.value(SignalId(i as u16))) {
-                    closed.push((i as u16, ep));
+        let residual_on = state.cfg.policy.residual;
+        let precedent_on = state.cfg.policy.precedent;
+        let bridge = state.bridge_cfg;
+        let regime_cfg = state.regime_cfg;
+        // Outputs gathered while the lineage entry is mutably borrowed.
+        let mut structural_verdicts_this_edge = 0u64;
+        let mut closed_structural: Option<StructuralEpisode> = None;
+        let mut closed_regime: Vec<(u16, RegimeEpisode)> = Vec::new();
+        {
+            let ls = state.lineages.entry(key).or_insert_with(|| {
+                let mut ls = LineageState::new(root);
+                if let Some(root_meta) = index.meta(&root) {
+                    ls.acc.init_baseline(&root_meta.signals);
+                }
+                ls
+            });
+            ls.frontier = entry_id;
+            ls.ordinal = ls.ordinal.saturating_add(1);
+            // Regime feeds on the moved axes. Episodes are collected here
+            // and persisted after the lineage borrow ends.
+            for i in 0..crate::target_runtime::signals::MAX_SIGNALS {
+                if edge.moved() & (1u64 << i) != 0 {
+                    let obs = ls
+                        .observers
+                        .entry(i as u16)
+                        .or_insert_with(|| RegimeObserver::new(regime_cfg));
+                    if let Some(ep) = obs.feed(ls.ordinal, edge.child.value(SignalId(i as u16))) {
+                        closed_regime.push((i as u16, ep));
+                    }
                 }
             }
+            // Phase 3: structured-signature history + the DSFB substrate.
+            if !morph.is_trivial() {
+                ls.push_history(generation, &morph);
+            }
+            if residual_on {
+                let (es, closed_ep) = ls.feed_structural(mutator, &edge, generation, &bridge)?;
+                // The bank names only structurally active edges; the durable
+                // verdict object records the edge's integer-reduced verdicts
+                // and the nomination.
+                let class = if es.verdicts.iter().any(|v| v.is_active()) {
+                    let mut ev = BankEvidence::new(&morph, &es.verdicts);
+                    for v in &es.verdicts {
+                        ev.set_role(v.axis, state.roles[v.axis as usize]);
+                    }
+                    let bv = classify_evidence(&ev);
+                    let code = bv.motif().map(|m| m.code()).unwrap_or(0);
+                    if code != 0 {
+                        eprintln!(
+                            "[campaign] bank: depth={} class={} axes={:#x}",
+                            generation,
+                            FuzzMotif::from_code(code).map(|m| m.name()).unwrap_or("?"),
+                            morph.axis_mask
+                        );
+                    }
+                    code
+                } else {
+                    0
+                };
+                ls.record_nomination(class, &es.verdicts);
+                // Persist a durable verdict when there is structural
+                // activity or a nomination (Level 1/2 boundary).
+                let persist = es.verdicts.iter().any(|v| v.is_active()) || class != 0;
+                if persist {
+                    let dv = DurableVerdict {
+                        root,
+                        mutator,
+                        depth: generation,
+                        axes: es.verdicts.clone(),
+                        class,
+                        morph_identity: morph.structural_identity(),
+                    };
+                    let payload = encode_verdict_payload(&dv)?;
+                    store.put(Family::StructuralVerdict, &payload)?;
+                    structural_verdicts_this_edge = 1;
+                }
+                closed_structural = closed_ep;
+            }
         }
-        for (signal, ep) in closed {
+        for (signal, ep) in closed_regime {
             state.write_episode(store, signal, ep)?;
+        }
+        if let Some(ep) = closed_structural {
+            let payload = encode_episode_payload(&ep)?;
+            store.put(Family::StructuralEpisode, &payload)?;
+            state.structural_episodes = state.structural_episodes.saturating_add(1);
+            eprintln!(
+                "[campaign] structural episode closed: root={} axes={:#x} peak_policy={} t=[{},{}]",
+                short_hex8(&ep.root),
+                ep.axes,
+                ep.peak_policy,
+                ep.t_open,
+                ep.t_close
+            );
+        }
+        if structural_verdicts_this_edge > 0 {
+            state.structural_verdicts = state
+                .structural_verdicts
+                .saturating_add(structural_verdicts_this_edge);
         }
         // Frontier advance in the amplify queue: the new child continues the
         // drifting lineage (same mutator). The priority gets a one-shot
@@ -1037,6 +1370,11 @@ fn process_result(
                     priority: entry.priority.saturating_add(AMPLIFY_HOT_BOOST),
                 },
             );
+        }
+        // Phase 3: precedent matching against the live lineage shape. Only
+        // structured signatures match (a trivial shape has no profile).
+        if residual_on && precedent_on && !morph.is_trivial() {
+            enqueue_precedent_probes(state, &morph, &root, mutator, entry_id);
         }
 
         // ---- durable tape for residual-interest admissions ----
@@ -1070,6 +1408,311 @@ fn process_result(
         }
     }
     Ok((admitted, new_global))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: precedent matching, probe execution/records, and precedent
+// admission from terminal observations.
+// ---------------------------------------------------------------------------
+
+/// Match a live lineage signature against the loaded precedent bank and
+/// enqueue probe orders (bounded). Never writes to the store; all queue
+/// state is in-memory (a probe queue is disposable campaign state — lost on
+/// restart, unlike precedent revisions).
+fn enqueue_precedent_probes(
+    state: &mut CampaignState,
+    sig: &MorphologySignature,
+    root: &ContentId,
+    mutator: u16,
+    frontier: ContentId,
+) {
+    if state.precedents.is_empty() {
+        return;
+    }
+    let matched: Vec<Precedent> = crate::precedent::matching_precedents(
+        state.precedents.values().map(|(_, p)| p),
+        sig,
+        sig.depth,
+        mutator,
+    )
+    .into_iter()
+    .cloned()
+    .collect();
+    for p in matched.into_iter().take(MAX_MATCHES_PER_EDGE) {
+        let gk = p.group_key();
+        let Some(&(pid, _)) = state.precedents.get(&gk) else {
+            continue;
+        };
+        state.precedent_matches = state.precedent_matches.saturating_add(1);
+        if state.probe_inflight.contains(&(pid, *root)) {
+            continue;
+        }
+        if state
+            .probes
+            .values()
+            .any(|e| e.precedent_id == pid && e.root == *root)
+        {
+            continue;
+        }
+        if state.probes.len() >= MAX_PROBE_ENTRIES {
+            break;
+        }
+        let class = if p.discriminates() {
+            SchedulingClass::Discriminate
+        } else {
+            SchedulingClass::Falsify
+        };
+        let seq = state.probe_seq;
+        state.probe_seq = state.probe_seq.wrapping_add(1);
+        eprintln!(
+            "[campaign] precedent match: status={} profile_depth={} axes={:#x} -> {} probe seq={}",
+            p.status.name(),
+            p.profile.depth,
+            p.profile.axis_mask,
+            class.name(),
+            seq
+        );
+        state.probes.insert(
+            seq,
+            ProbeEntry {
+                seq,
+                class,
+                precedent: p,
+                precedent_id: pid,
+                root: *root,
+                mutator,
+                frontier,
+                priority: u64::MAX - seq,
+            },
+        );
+    }
+}
+
+/// Evaluate a completed probe batch against the precedent's falsifiable
+/// relationship and record the outcome as a new precedent revision. A
+/// contradiction is retained as negative knowledge (I10); a precedent is
+/// never deleted.
+fn record_probe_result(
+    store: &Store,
+    state: &mut CampaignState,
+    entry: &ProbeEntry,
+    result: &WorkResult,
+) -> Result<()> {
+    let gk = entry.precedent.group_key();
+    let Some((pid, current)) = state.precedents.get(&gk).map(|(id, p)| (*id, p.clone())) else {
+        return Ok(()); // the family is gone; nothing to record against
+    };
+    let recipe = current.recipe;
+    let outcome = eval_probe(&recipe, &result.signal_summary);
+    let axis = recipe.axis as usize;
+    let moved = if axis < MAX_SIGNALS {
+        result.signal_summary.count[axis]
+    } else {
+        0
+    };
+    let run = if axis < MAX_SIGNALS {
+        result.signal_summary.max_run[axis]
+    } else {
+        0
+    };
+    let sum_abs = if axis < MAX_SIGNALS {
+        result.signal_summary.sum_abs_delta[axis]
+    } else {
+        0
+    };
+    let evidence = crate::precedent::ProbeEvidence {
+        outcome,
+        seq: state.admission_seq,
+        axis: recipe.axis,
+        moved,
+        run,
+        sum_bucket: crate::target_runtime::signals::magnitude_bucket(sum_abs),
+        batch_execs: result.exec_count,
+    };
+    let direct = crate::precedent::contradiction_weight(&recipe, &result.signal_summary)
+        == crate::precedent::ContradictionWeight::Direct;
+    persist_probe_update(store, state, &current, pid, outcome, evidence, direct)?;
+    state.probe_inflight.remove(&(pid, entry.root));
+    eprintln!(
+        "[campaign] probe outcome: {} axis={} moved={} run={} execs={}",
+        outcome.name(),
+        recipe.axis,
+        moved,
+        run,
+        result.exec_count
+    );
+    Ok(())
+}
+
+/// A worker died while a probe order was executing: the probe batch reached
+/// the terminal event itself. That is the strongest form of confirmation
+/// (the continuation recurred under the falsify order).
+fn record_probe_crash(store: &Store, state: &mut CampaignState, entry: &ProbeEntry) -> Result<()> {
+    let gk = entry.precedent.group_key();
+    let Some((pid, current)) = state.precedents.get(&gk).map(|(id, p)| (*id, p.clone())) else {
+        return Ok(());
+    };
+    let evidence = crate::precedent::ProbeEvidence {
+        outcome: ProbeOutcome::Support,
+        seq: state.admission_seq,
+        axis: current.recipe.axis,
+        moved: 0,
+        run: 0,
+        sum_bucket: 0,
+        batch_execs: 0,
+    };
+    persist_probe_update(
+        store,
+        state,
+        &current,
+        pid,
+        ProbeOutcome::Support,
+        evidence,
+        false,
+    )?;
+    state.probe_inflight.remove(&(pid, entry.root));
+    eprintln!(
+        "[campaign] probe order crashed: continuation confirmed for precedent {}",
+        short_hex8(&pid)
+    );
+    Ok(())
+}
+
+/// Persist one probe outcome as a new precedent revision and refresh the
+/// in-memory current revision.
+fn persist_probe_update(
+    store: &Store,
+    state: &mut CampaignState,
+    current: &Precedent,
+    pid: ContentId,
+    outcome: ProbeOutcome,
+    evidence: crate::precedent::ProbeEvidence,
+    direct: bool,
+) -> Result<()> {
+    let (status, supports, contradictions, ambiguous) =
+        current.apply_probe(outcome, evidence, direct);
+    let mut rev = current.clone();
+    rev.status = status;
+    rev.supports = supports;
+    rev.contradictions = contradictions;
+    rev.ambiguous_probes = ambiguous;
+    rev.prev_revision = Some(pid);
+    rev.updated_seq = state.admission_seq;
+    rev.evidence.insert(0, evidence);
+    if rev.evidence.len() > crate::precedent::model::MAX_PRECEDENT_EVIDENCE {
+        rev.evidence
+            .truncate(crate::precedent::model::MAX_PRECEDENT_EVIDENCE);
+    }
+    let new_id = save_precedent_revision(store, &rev)?;
+    state.precedent_revisions = state.precedent_revisions.saturating_add(1);
+    let gk = rev.group_key();
+    state.precedents.insert(gk, (new_id, rev));
+    match outcome {
+        ProbeOutcome::Support => state.probe_supports = state.probe_supports.saturating_add(1),
+        ProbeOutcome::Contradict => {
+            state.probe_contradictions = state.probe_contradictions.saturating_add(1)
+        }
+        ProbeOutcome::Ambiguous => state.probe_ambiguous = state.probe_ambiguous.saturating_add(1),
+    }
+    eprintln!(
+        "[campaign] precedent {} -> {} (supports {} contradictions {})",
+        short_hex8(&new_id),
+        status.name(),
+        supports,
+        contradictions
+    );
+    Ok(())
+}
+
+/// Admit (or confirm) a precedent from a real terminal observation: the
+/// lineage that just crashed with a structured precursor history becomes a
+/// durable precedent with a falsifiable probe relationship (I9: provenance;
+/// §17: every precedent carries ≥ 1 falsifiable relationship).
+fn maybe_admit_precedent(
+    store: &Store,
+    state: &mut CampaignState,
+    index: &CorpusIndex,
+    pend: &PendingOrder,
+    kind: FindingKind,
+    finding_id: &ContentId,
+) -> Result<()> {
+    if !state.cfg.policy.residual || !state.cfg.policy.precedent || pend.is_override {
+        return Ok(());
+    }
+    let terminal_kind = match kind {
+        FindingKind::Crash => TerminalKind::CrashFinding,
+        FindingKind::Timeout => TerminalKind::TimeoutFinding,
+        FindingKind::Unattributed => return Ok(()),
+    };
+    let Some(root) = state.root_of(index, &pend.parent_id) else {
+        return Ok(());
+    };
+    let mutator = pend.order.mutator_id;
+    let key = (root, mutator);
+    let Some(ls) = state.lineages.get(&key) else {
+        return Ok(());
+    };
+    if ls.shape_history.is_empty() {
+        return Ok(());
+    }
+    let terminal_depth = pend.parent_generation.saturating_add(1);
+    let history: Vec<(u32, MorphologySignature)> = ls.shape_history.iter().cloned().collect();
+    let Some((precursor, precursor_depth)) = choose_precursor(&history, terminal_depth) else {
+        return Ok(());
+    };
+    let axis = ls
+        .last_verdict_axis
+        .or_else(|| precursor.dominant_axis())
+        .unwrap_or(0);
+    let class = ls.last_class;
+    let gk = (
+        root,
+        mutator,
+        PrefixProfile::from_signature(&precursor, precursor_depth).profile_identity(),
+    );
+    // A repeated terminal event on the same family confirms the existing
+    // precedent rather than duplicating it.
+    if state.precedents.contains_key(&gk) {
+        let _ = (class, terminal_kind, axis);
+        return Ok(());
+    }
+    let recipe = crate::precedent::derive_recipe(
+        crate::mutation::MutatorId::from_id(mutator).unwrap_or(crate::mutation::MutatorId::BitFlip),
+        axis,
+        (state.cfg.policy.batch_size / 8).max(4) as u32,
+        PROBE_MIN_RUN,
+        PROBE_MIN_BUCKET,
+    );
+    let Some(p) = create_from_terminal(
+        root,
+        crate::mutation::MutatorId::from_id(mutator).unwrap_or(crate::mutation::MutatorId::BitFlip),
+        &precursor,
+        precursor_depth,
+        terminal_kind,
+        class,
+        axis,
+        0,
+        terminal_depth,
+        Some(*finding_id),
+        ConfuserKind::None,
+        recipe,
+        state.admission_seq,
+    ) else {
+        return Ok(());
+    };
+    let id = save_precedent_revision(store, &p)?;
+    state.precedent_revisions = state.precedent_revisions.saturating_add(1);
+    state.precedents.insert(gk, (id, p));
+    eprintln!(
+        "[campaign] precedent admitted: root={} mutator={} profile_depth={} axes={:#x} -> {} (depth {})",
+        short_hex8(&root),
+        mutator,
+        precursor_depth,
+        precursor.axis_mask,
+        terminal_kind.name(),
+        terminal_depth
+    );
+    Ok(())
 }
 
 /// Compute the tentative morphology for a discovery WITHOUT committing the
@@ -1120,7 +1763,7 @@ fn commit_morphology(
         .unwrap_or(pend.parent_id);
     let key = (root, mutator);
     let ls = state.lineages.entry(key).or_insert_with(|| {
-        let mut ls = LineageState::new();
+        let mut ls = LineageState::new(root);
         if let Some(root_meta) = index.meta(&root) {
             ls.acc.init_baseline(&root_meta.signals);
         }
@@ -1295,6 +1938,17 @@ fn handle_worker_death(
             if p.is_amplify {
                 state.amplify.remove(&(p.parent_id, p.order.mutator_id));
             }
+            // Phase 3: a probe order that crashed confirms the precedent's
+            // continuation (the falsify order reached the terminal event).
+            if let Some(entry) = &p.probe {
+                record_probe_crash(store, state, entry)?;
+            }
+        }
+        // Phase 3: a structured lineage that reached a terminal event
+        // becomes (or confirms) a durable precedent with a falsifiable
+        // relationship.
+        if let Some(p) = pend.as_ref() {
+            maybe_admit_precedent(store, state, index, p, kind, &id)?;
         }
         // Deliberate replay to classify and confirm. Crash inputs are NOT
         // admitted to the corpus (their feature sets were never measured —
@@ -1353,6 +2007,7 @@ fn pending_for_recon(
             parent_generation: p.parent_generation,
             is_override: p.is_override,
             is_amplify: p.is_amplify,
+            probe: p.probe.clone(),
         }),
         None => Err(Error::Other(
             "worker died with a ledger coordinate but no pending order to reconstruct from".into(),
@@ -1469,8 +2124,10 @@ fn encode_campaign(cfg: &CampaignConfig) -> Result<Vec<u8>> {
     out.extend_from_slice(&cfg.policy.batch_size.to_le_bytes());
     out.extend_from_slice(&cfg.policy.timeout_ms.to_le_bytes());
     out.push(u8::from(cfg.policy.residual));
-    out.extend_from_slice(&cfg.policy.class_weights[0].to_le_bytes());
-    out.extend_from_slice(&cfg.policy.class_weights[1].to_le_bytes());
+    out.push(u8::from(cfg.policy.precedent));
+    for w in cfg.policy.class_weights {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
     let flags = cfg.instrument_flags.join(" ");
     push_str(&mut out, &flags, 4096)?;
     Ok(out)
@@ -1559,6 +2216,11 @@ fn load_checkpoint_next_index(
         out.insert(short, idx);
     }
     Ok(out)
+}
+
+fn short_hex8(id: &ContentId) -> String {
+    let h = id.to_hex();
+    h[..8].to_string()
 }
 
 fn hex(b: &[u8]) -> String {

@@ -168,14 +168,13 @@ impl CounterRng {
 
     /// Fill `out` with deterministic bytes (little-endian u32 writes).
     pub fn fill_bytes(&mut self, out: &mut [u8]) {
-        let mut chunks = out.chunks_exact_mut(4);
-        for chunk in &mut chunks {
+        let (chunks, remainder) = out.as_chunks_mut::<4>();
+        for chunk in chunks {
             chunk.copy_from_slice(&self.next_u32().to_le_bytes());
         }
-        let rem = chunks.into_remainder();
-        if !rem.is_empty() {
+        if !remainder.is_empty() {
             let v = self.next_u32().to_le_bytes();
-            rem.copy_from_slice(&v[..rem.len()]);
+            remainder.copy_from_slice(&v[..remainder.len()]);
         }
     }
 

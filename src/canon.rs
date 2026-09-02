@@ -81,11 +81,18 @@ pub enum Family {
     /// The target's registered signal schema (name/unit per signal ID).
     /// Content-addressed: identical schemas share one object.
     SignalSchema = 0x0C,
+    /// A DSFB structural verdict (Phase 3): the integer-reduced structural
+    /// reading of one admitted lineage edge (axes, grammar/reason/policy
+    /// codes, direction, deviation magnitudes) plus its bank nomination.
+    StructuralVerdict = 0x0D,
+    /// A closed DSFB-flavored structural episode (Phase 3): the lineage
+    /// segment during which at least one axis sustained policy ≥ Review.
+    StructuralEpisode = 0x0E,
 }
 
 impl Family {
     /// All defined families.
-    pub const ALL: [Family; 12] = [
+    pub const ALL: [Family; 14] = [
         Family::CorpusEntry,
         Family::Finding,
         Family::RunTape,
@@ -98,6 +105,8 @@ impl Family {
         Family::Config,
         Family::CorpusMeta,
         Family::SignalSchema,
+        Family::StructuralVerdict,
+        Family::StructuralEpisode,
     ];
 
     /// The one-byte family code.
@@ -125,6 +134,8 @@ impl Family {
             Family::Config => "config",
             Family::CorpusMeta => "corpus-meta",
             Family::SignalSchema => "signal-schema",
+            Family::StructuralVerdict => "structural-verdict",
+            Family::StructuralEpisode => "structural-episode",
         }
     }
 }

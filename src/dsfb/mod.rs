@@ -21,9 +21,17 @@
 //! Phase 6 adds `database_bridge`. They are NOT stubbed here
 //! (docs/ROADMAP.md).
 
+pub mod debug_bridge;
+pub mod fuzz_bank;
 pub mod morphology;
 pub mod regime;
 
+pub use debug_bridge::{
+    AxisVerdict, BridgeConfig, DriftDir, EdgeStructural, LineageSubstrate, StructuralEpisode,
+};
+pub use fuzz_bank::{
+    AxisRole, BankEvidence, BankVerdict, FuzzMotif, FuzzMotifDef, MotifProvenance,
+};
 pub use morphology::{
     classify, LineageAccumulator, MorphologySignature, StructuralClass, Triviality,
 };

@@ -11,23 +11,23 @@ env:
 
 jobs:
   msrv:
-    name: MSRV (1.85) + feature matrix
+    name: MSRV (1.98) + feature matrix
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.85.0
+          toolchain: 1.98.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Build (default features)
-        run: cargo +1.85.0 build
+        run: cargo +1.98.0 build
       - name: Test (default features)
-        run: cargo +1.85.0 test
+        run: cargo +1.98.0 test
       - name: Build + test (target-runtime only)
-        run: cargo +1.85.0 test --no-default-features --features target-runtime
+        run: cargo +1.98.0 test --no-default-features --features target-runtime
       - name: Clippy (all targets, all features)
-        run: cargo +1.85.0 clippy --all-targets --all-features -- -D warnings
+        run: cargo +1.98.0 clippy --all-targets --all-features -- -D warnings
 
   stable:
     name: Stable (latest)

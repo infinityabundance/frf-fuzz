@@ -1,8 +1,8 @@
 [package]
 name = "frf-fuzz"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 description = "Heterogeneous residual-guided fuzzing engine: coverage + compare + residual structure + DSFB endoduction + FRF verification + Gemel longitudinal memory. One crate, two planes."
 readme = "README.md"
