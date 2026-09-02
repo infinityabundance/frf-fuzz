@@ -1,6 +1,6 @@
 # frf-fuzz Dependency Policy and Pin Record
 
-Status: Phase 6. Every dependency exists for a recorded reason. Versions are
+Status: Phase 7. Every dependency exists for a recorded reason. Versions are
 pinned (`=`) for integration-sensitive crates. The core default build stays
 small enough to audit; the target-runtime build is dependency-tiny.
 
@@ -39,9 +39,13 @@ of 1.85.
   part of the public contract.
 * **No criterion**: benches are hand-rolled; re-evaluate in Phase 5 when
   measuring hot paths.
-* **No GPU dependency yet** (Phase 7): `cuda`/`rocm` features are reserved
-  and dependency-free so feature-enabled builds compile without hardware
-  (I15).
+* **No GPU dependency yet** (Phase 7 spike record): CubeCL was inspected
+  (cubecl-core 0.10.0 stable / 0.11.0-pre.3, edition 2024, no declared MSRV)
+  but its decisive admission gates need a CUDA/ROCm device, which the
+  development machine lacks. `cuda`/`rocm` features therefore stay reserved
+  and dependency-free (I15) so feature-enabled builds compile without
+  hardware; the `gpu/` coordinator module ships the CPU oracle with zero
+  dependencies.
 * **No rand**: determinism is counter-based Philox, our own implementation
   with official KAT vectors.
 

@@ -85,10 +85,15 @@ default = ["coordinator"]
 coordinator = ["dep:blake3", "dep:frf", "dep:gemel", "dep:dsfb-debug"]
 target-runtime = []
 database = ["dep:dsfb-database"]
-cuda = []          # reserved (Phase 7)
-rocm = []          # reserved (Phase 7)
+cuda = []          # reserved: no device adapter admitted (Phase-7 gates)
+rocm = []          # reserved: no device adapter admitted (Phase-7 gates)
 dangerous-inprocess = []   # reserved
 ```
+
+The coordinator `gpu/` module (batch-compute contract + CPU oracle) is part
+of the `coordinator` feature and adds no dependencies. Enabling `cuda` or
+`rocm` changes nothing yet: `gpu::resolve(Some(Cuda|Rocm))` falls back to
+the CPU oracle and records the reason (I14/I15).
 
 The user's fuzz harness depends on `frf-fuzz` with
 `default-features = false, features = ["target-runtime"]`. The coordinator
@@ -520,13 +525,27 @@ Implementation (`src/gemel_bridge.rs`):
   digests, both termination statuses, and both signal observations; the
   typed residual R_V is derived at decode time ([`RevisionResidual::of`]).
 
-## 17. GPU (Phase 7)
+## 17. GPU (Phase 7, implemented)
 
-`ComputeBackend` trait; CPU is the semantic oracle (I8). GPU output is
-proposal/ranking evidence only. CubeCL first (one kernel -> CUDA + HIP/ROCm),
-gated on the compatibility/performance spike; cudarc/rocmrc as fallback.
-No MSRV raise, no per-input kernels, batched workloads, pinned buffers,
-async streams, remove-without-semantic-change.
+`gpu/` ships the batch-compute architecture: [`ComputeBackend`](crate::gpu::ComputeBackend)
+with five batch operations — `generate_mutation_plans`, `morphology_distance`,
+`precedent_rank`, `influence_masks`, `compact_descriptors` — plus backend
+resolution ([`resolve`](crate::gpu::resolve)/[`probe`](crate::gpu::probe)).
+CPU is the semantic oracle ([`CpuBackend`](crate::gpu::CpuBackend), always
+available, normative). GPU output is proposal/ranking evidence only (I8).
+All kernels are integer-only and bounded; empty batches are valid
+(empty in -> empty out); every output is deterministic and repeated-run
+tested.
+
+Device backends are NOT admitted yet: CubeCL (one kernel -> CUDA + HIP/ROCm)
+remains the preferred route but its admission gates (CPU == CUDA == ROCm
+bit-for-bit, repeated device determinism, acceptable compile/startup cost,
+measured speedup on realistic batch sizes) can only be verified on real
+hardware, which this development machine does not have (doctor records the
+toolchain state; `cuda`/`rocm` features stay dependency-free and reserved,
+I15). cudarc/rocmrc remain the documented fallback adapters. No MSRV raise,
+no per-input kernels; when an accelerator is admitted, workloads stay
+batched with the CPU kernels above as the equality reference.
 
 ## 18. Module layout
 
@@ -540,8 +559,9 @@ admission,minimize}`, `observe/{frame,residual,signals,sketch}`,
 `dsfb/{regime,morphology,debug_bridge,fuzz_bank}`,
 `precedent/{mod,model,matching,probe,admission}`, `scheduler/policy`,
 `execute/{finding,worker_process,coordinator}`, `boundary/{witness,
-minimize}`, `tape/{model,replay,revision}`, `frf_bridge`, `gemel_bridge`,
-`report`, `cli`, `bin/{frf-fuzz,cargo-frf-fuzz}`. Later phases add `gpu/`.
+minimize}`, `tape/{model,replay,revision}`, `gpu/{backend,cpu}`,
+`frf_bridge`, `gemel_bridge`,
+`report`, `cli`, `bin/{frf-fuzz,cargo-frf-fuzz}`.
 `dsfb/database_bridge` (Phase 6) is compiled only when the `database`
 feature is enabled; it is the sole frf-fuzz module that links
 `dsfb-database`.

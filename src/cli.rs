@@ -429,11 +429,20 @@ fn run_doctor(nightly: &str, root: &Path) -> Result<DoctorReport> {
     }
 
     // ---- 6. GPU availability (when requested) ----
+    // The coordinator `gpu/` module ships the batch-compute contract with the
+    // CPU oracle; a CUDA/ROCm TOOLCHAIN is necessary but not sufficient — a
+    // device backend is admitted only after the Phase-7 parity gates pass on
+    // real hardware (COMPATIBILITY.md §6), and none has been yet. These
+    // checks therefore report the toolchain and state that no adapter is
+    // admitted, so "toolchain present" is never mistaken for an active GPU
+    // backend (I8/I15).
     let cuda = tool_on_path("nvcc") || tool_on_path("nvidia-smi");
     let rocm = tool_on_path("hipcc") || tool_on_path("rocminfo");
+    let backend_note =
+        "no device adapter admitted (Phase-7 parity gates unverified); CPU oracle is used";
     if cfg!(feature = "cuda") {
         checks.push(if cuda {
-            Check::ok("CUDA", "toolchain present")
+            Check::ok("CUDA", format!("toolchain present; {backend_note}"))
         } else {
             Check::fail("CUDA", "feature enabled but no CUDA toolchain found")
         });
@@ -446,7 +455,7 @@ fn run_doctor(nightly: &str, root: &Path) -> Result<DoctorReport> {
     }
     if cfg!(feature = "rocm") {
         checks.push(if rocm {
-            Check::ok("ROCm", "toolchain present")
+            Check::ok("ROCm", format!("toolchain present; {backend_note}"))
         } else {
             Check::fail("ROCm", "feature enabled but no ROCm toolchain found")
         });
@@ -457,6 +466,16 @@ fn run_doctor(nightly: &str, root: &Path) -> Result<DoctorReport> {
             Check::ok("ROCm", "not requested / not detected")
         });
     }
+    // The batch compute backend in effect (CPU oracle unless an admitted
+    // accelerator exists).
+    let cfg_gpu = crate::gpu::resolve(None);
+    checks.push(Check::ok(
+        "ComputeBackend",
+        match cfg_gpu.backend {
+            crate::gpu::BackendKind::Cpu => "CPU oracle (normative)",
+            other => other.name(),
+        },
+    ));
 
     // ---- 7. FRF dependency compatibility ----
     checks.push(Check::ok(

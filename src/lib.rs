@@ -28,7 +28,10 @@
 //! * `default = ["coordinator"]` — full coordinator.
 //! * `target-runtime` — tiny runtime for instrumented fuzz targets.
 //! * `database` — real dsfb-database bridge for database telemetry targets.
-//! * `cuda` / `rocm` — reserved GPU backends (Phase 7).
+//! * `cuda` / `rocm` — reserved GPU backend features (Phase 7). The
+//!   coordinator `gpu/` module ships the batch-compute contract and its CPU
+//!   oracle; no device adapter is admitted until the Phase-7 parity gates
+//!   pass on real hardware, so these features stay dependency-free.
 //! * `dangerous-inprocess` — reserved in-process execution opt-in.
 //!
 //! # Safety policy
@@ -81,6 +84,9 @@ pub mod gemel_bridge;
 
 #[cfg(feature = "coordinator")]
 pub mod dsfb;
+
+#[cfg(feature = "coordinator")]
+pub mod gpu;
 
 #[cfg(feature = "coordinator")]
 pub mod precedent;

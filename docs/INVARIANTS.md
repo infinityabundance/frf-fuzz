@@ -110,8 +110,13 @@ worlds — the refusal is type-level.
 CPU is the oracle. GPU output is proposal/ranking evidence only; on
 disagreement the GPU backend is quarantined and CPU semantics stand.
 
-* Code: `gpu/` (Phase 7) — `ComputeBackend` trait documented as
-  evidence-only.
+* Code: `gpu/` (Phase 7) — `ComputeBackend` documented as evidence-only;
+  every batch op returns proposals/rankings/distances/descriptors, never a
+  verdict. No device backend is admitted yet, so the CPU oracle is the only
+  backend (`CpuBackend`); an admitted accelerator must be bit-for-bit
+  identical to it (same discipline as I3).
+* Enforcement: `examples/gpu_backend_demo.rs` exercises the oracle and the
+  recorded fallback; `gpu::resolve` never substitutes a device silently.
 
 ## I9. No historical precedent is admitted without provenance
 
@@ -182,8 +187,10 @@ record with a deterministic failure class and the campaign continues.
 ## I15. Feature-disabled builds contain no hidden dependency on unavailable hardware
 
 `target-runtime` builds contain no GPU/sanitizer/hardware dependency; the
-`cuda`/`rocm` features compile and run without the hardware present (they are
-reserved and dependency-free in Phase 0).
+`cuda`/`rocm` features compile and run without the hardware present (they
+stay reserved and dependency-free: no device adapter has passed the
+Phase-7 parity gates, so `gpu::resolve` uses the CPU oracle and records the
+refusal when an accelerator is requested).
 
 * Code: Cargo feature matrix; `is_x86_feature_detected!`-guarded AVX2.
 * Verified: `cargo build --no-default-features --features target-runtime`

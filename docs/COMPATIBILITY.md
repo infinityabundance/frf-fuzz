@@ -215,14 +215,31 @@ anything. Note: numpy's `Philox` state does NOT map 1:1 to Random123
 semantics (numpy applies its own state layout); the official vectors are the
 authoritative cross-check.
 
-## 6. GPU (Phase 7 gates)
+## 6. GPU (Phase 7, gate record)
 
-CubeCL will be admitted only if: CPU == CUDA == ROCm bit-for-bit, repeated
-GPU runs deterministic, compile/startup cost acceptable, optional feature
-does not break the Rust-1.98 default build, no unreasonable dependency
-contamination, measured speedup on realistic batch sizes. cudarc (CUDA
-11.4..13.x) and rocmrc (younger) are the fallback adapters. The GPU work
-itself must not force a further MSRV raise.
+The admission gates for a device backend are unchanged and now codified in
+the code: CPU == CUDA == ROCm bit-for-bit (the `gpu/` CPU kernels are the
+equality reference), repeated GPU runs deterministic, acceptable
+compile/startup cost, optional feature does not break the Rust-1.98 default
+build, no unreasonable dependency contamination, measured speedup on
+realistic batch sizes. cudarc (CUDA 11.4..13.x) and rocmrc (younger) are
+the fallback adapters. The GPU work itself must not force a further MSRV
+raise.
+
+Phase-7 spike record (2026-09-02): CubeCL was inspected from crates.io
+(cubecl-core 0.10.0 stable, 0.11.0-pre.3 newest; edition 2024, no declared
+rust-version — it would compile on the 1.98 build, so the MSRV gate alone
+does not exclude it). The decisive gates (CPU == CUDA == ROCm measured
+bit-for-bit, repeated device determinism, measured speedup) require a
+CUDA/ROCm device and toolchain; this development machine has none
+(`frf-fuzz doctor` records the toolchain state and reports that no device
+adapter is admitted). No device backend is therefore admitted: the `cuda`/
+`rocm` features stay reserved and dependency-free, `gpu::resolve` always
+falls back to the CPU oracle with a recorded note (I14/I15), and the CPU
+kernels in `gpu/cpu.rs` are the reference a future adapter must pass before
+it can change throughput. CubeCL remains the preferred route; cudarc and
+rocmrc remain the documented fallbacks if CubeCL fails its gates on real
+hardware.
 
 ## 7. Database (Phase 6, verified)
 

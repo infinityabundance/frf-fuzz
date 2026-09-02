@@ -377,10 +377,57 @@ machine) — never in the per-execution loop.
 - Docs: `ARCHITECTURE.md` §12, `COMPATIBILITY.md` §7 + §11, `DESIGN-DSFB.md`
   (Phase-6 enforcement now shipped), `DEPENDENCIES.md` status.
 
-## Phase 7 — GPU
+## Phase 7 — GPU (DONE)
 
-- CubeCL spike against the gates in `COMPATIBILITY.md` §6; `ComputeBackend`
-  trait; batch acceleration only after CPU semantics are sealed.
+- `src/gpu/` (coordinator feature, zero new dependencies): the batch-compute
+  architecture with the CPU implementation as the semantic oracle.
+  - `gpu/backend.rs`: `ComputeBackend` trait (five batch ops:
+    `generate_mutation_plans`, `morphology_distance`, `precedent_rank`,
+    `influence_masks`, `compact_descriptors`), backend kinds + `probe` +
+    `resolve`, the shared validation/bounds contract, and deterministic
+    `rank_desc`. All ops are integer-only (no floats in any output that
+    could enter a ranking/identity decision), bounded before allocation,
+    and defined to accept empty batches (empty in -> empty out).
+  - `gpu/cpu.rs`: `CpuBackend` — the normative oracle. Plans allocate the
+    order budget across candidates by u64 largest-remainder over
+    priorities (ties by index) with seeded mutator rotation (Philox);
+    distances are xor-popcounts; ranks are integer fixed-point proximity
+    scores; masks and compact descriptors are seeded counter-stream
+    folds. Every op is a plain bounded loop a device kernel must
+    replicate bit-for-bit.
+  - I8 discipline: every op's output is proposal/ranking evidence only;
+    nothing decides "bug"/"precedent true"/"FRF claim passes".
+    I14/I15: `resolve(Some(Cuda|Rocm))` falls back to the CPU oracle and
+    records the reason — never a silent substitute.
+  - `doctor` reports the CUDA/ROCm TOOLCHAIN and states that no device
+    adapter is admitted (toolchain presence is not an active backend),
+    plus the in-effect `ComputeBackend` (CPU oracle).
+- CubeCL spike (recorded 2026-09-02): cubecl-core 0.10.0 stable /
+  0.11.0-pre.3 inspected from crates.io — edition 2024, no declared MSRV
+  (compiles on the 1.98 build), so the MSRV gate alone does NOT exclude it.
+  The DECISIVE gates (CPU == CUDA == ROCm bit-for-bit, repeated device
+  determinism, acceptable compile/startup cost, measured speedup on
+  realistic batch sizes) require a CUDA/ROCm device + toolchain, which this
+  development machine does not have (doctor records the absence). No device
+  backend is therefore admitted; `cuda`/`rocm` features stay reserved and
+  dependency-free; the CPU kernels above are the equality reference a
+  future adapter must pass (docs/COMPATIBILITY.md §6). cudarc/rocmrc remain
+  the documented fallback adapters if CubeCL fails its gates later.
+- Demo: `examples/gpu_backend_demo.rs` + `scripts/gpu_demo.sh`
+  (`cargo run --example gpu_backend_demo`): deterministic proposals
+  (priority shares 12/6/2 over a 20-order budget), bit-exact morphology
+  distances, integer precedent ranking with deterministic ordering,
+  deterministic masks/descriptors, and the recorded CUDA/ROCm fallback to
+  the CPU oracle — prints GPU BACKEND DEMO PASS.
+- Tests: unit tests across `gpu/` (determinism, priority allocation,
+  zero-priority equal split, validation/bounds refusal, exact + symmetric
+  distances incl. max-distance, rank ordering and tie-breaking, mask
+  coverage + seed sensitivity, descriptor distinctness, compact-batch
+  validation, empty-batch validity, fallback resolution with recorded
+  notes, stable kind codes). No semantic change to any earlier phase: the
+  worker/coordinator hot paths are untouched.
+- Docs: `ARCHITECTURE.md` §3 + §17 + §18, `COMPATIBILITY.md` §6,
+  `DEPENDENCIES.md`, `INVARIANTS.md` I8/I15, `README.md` status.
 
 ## Phase 8 — Scientific Evaluation
 
