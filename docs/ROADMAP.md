@@ -11,8 +11,9 @@ Deliverables, all verified:
 
 - Dependency forensics: frf 0.1.72, gemel 0.11.0, dsfb-debug 0.1.0,
   dsfb-database 0.1.1 inspected from source (`.phase0/forensics/REPORT-*.md`).
-- Pinned dependency matrix (`docs/DEPENDENCIES.md`), MSRV 1.85 verified for
-  the whole feature matrix.
+- Pinned dependency matrix (`docs/DEPENDENCIES.md`), MSRV verified for the
+  whole feature matrix (the Phase-3 section below records the later raise
+  to 1.98).
 - Instrumentation spikes: `sancov-module` on LLVM 20..22, trace-cmp
   callbacks, footprint calibration/masking, `--target` rule, LTO-off rule,
   ASan/trace-compares incompatibility — all documented in
@@ -114,12 +115,80 @@ with a branchless marker-count lookup table), and the family-15
 reconstruction determinism gap (the discovery now carries the exact compare
 hits the mutation consumed).
 
-## Phase 3 — DSFB Endoduction
+## Phase 3 — DSFB Endoduction (DONE)
 
-- dsfb-debug integration (verified call sequences in `docs/DESIGN-DSFB.md`),
-  FuzzSemanticBank, witness/confuser logic, structural episodes,
-  DISCRIMINATE/FALSIFY queues, probe recipes, precedent bank with
-  falsifiable relationships, negative controls from `EXPERIMENT_PROTOCOL.md`.
+- `src/dsfb/debug_bridge.rs`: real dsfb-debug 0.1.0 substrate integration.
+  The bridge calls the crate's public free functions
+  (`sign::compute_sign_tuple`, `sign::drift_persistence`,
+  `grammar::evaluate_raw_grammar`, `grammar::hysteresis_confirm`,
+  `dsa::compute_dsa_score`, `dsa::consistency_gate`,
+  `policy::apply_policy`) with `SemanticDisposition::Unknown` only — never
+  DSFB production motifs (I6). One substrate per ROOT: all mutator families
+  of a root share the behavioral stream (earlier per-(root,mutator) wiring
+  produced fragmented streams and no calibrated envelope — a Phase-3
+  finding). Declared calibration law: the first `calibration_windows` (8)
+  axis-event windows fix mean and rho = max(3 sigma, 2 x span); perfectly
+  flat axes become "discrete" (no envelope grammar — frf-fuzz state classes
+  interpret them). Real boundary density (over the recent raw-grammar ring)
+  is fed into the DSA score instead of the crate's hardcoded 0.0. Axis
+  verdicts are integer-only, with durable `Family::StructuralVerdict` (0x0D)
+  objects and closed structural episodes persisted as
+  `Family::StructuralEpisode` (0x0E).
+- `src/dsfb/fuzz_bank.rs`: the FuzzSemanticBank — 13 fuzz-specific classes
+  (ComparisonConvergence..CrossSignalPropagation; names describe structural
+  observations, never causes), per-class
+  gates/prerequisites/refusals/confusers/provenance/recommended families,
+  deterministic integer scoring with specificity tiers, an ambiguity guard
+  (an exact same-score same-tier rival stays Unknown), axis roles derived
+  from schema names, and the hard Structured+Unknown discipline (I6).
+- `src/precedent/{mod,model,matching,probe,admission}.rs`: durable
+  revisioned precedent bank (content-addressed `Family::Precedent` 0x05),
+  shape-subsumption matching with a lead window, falsifiable probe recipes
+  evaluated on real batch summaries (Support/Contradict/Ambiguous; direct
+  contradiction flips status; partial contradictions accumulate x3),
+  precedent admission only from real terminal observations (provenance),
+  contradictions never deleted (I10), and
+  `load_current`/`save_revision`/`verify_links` for fsck.
+- Scheduler: DISCRIMINATE and FALSIFY scheduling classes (weighted
+  round-robin over 4 weights) with the probe queue and in-flight sets
+  bounded in the coordinator; `--precedent on|off`, `--discriminate-weight`
+  and `--falsify-weight` CLI flags.
+- CLI/report/fsck: `frf-fuzz precedent list|show`; `inspect` decodes
+  verdict/episode/precedent payloads; `report` counts structural
+  verdicts/episodes, precedent families and revisions; `fsck` verifies
+  precedent revision chains, lineage roots (corpus entries) and terminal
+  references.
+- Demo/tests: `scripts/golden_demo.sh` extended with Phase-3 stages;
+  `examples/precedent_engine_demo.rs` demonstrates acceptance items 10-12
+  (a precedent proposes a falsify probe; the probe can support or
+  contradict; a contradiction is durably retained; the store stays
+  fsck-clean); `tests/endoduction.rs` = 7 negative-control + acceptance
+  tests (noise-only lineage names nothing, threshold elasticity collapses
+  to Unknown, replay determinism/shuffle, match+support+contradiction
+  retention, substrate escalation naming, role determinism).
+- Coordinator MSRV raised to 1.98 (`rust-version = "1.98"`, edition 2021,
+  crate 0.3.0) by explicit user decision to use the latest stable rustc.
+  The pinned instrumented nightly was re-verified and re-pinned
+  (`nightly-2026-07-24`, rustc 1.99.0-nightly, LLVM 22.1.8) and the
+  instrumented flag set re-proven end-to-end via `scripts/nightly_spike.sh`
+  and `scripts/golden_demo.sh` (details in `docs/COMPATIBILITY.md`).
+
+Measured on the golden-demo target (8 workers, 15 s per campaign, pinned
+nightly): the residual-on store ends with 45 corpus entries, 36 coverage
+features, 33 state features, 39 morphology signatures, ~21 structural
+verdict objects and 1-3 candidate precedent families (the run that formed 3
+held precedents across mutators 9/12/14), fsck-clean including precedent
+links. The coverage-only control forms 0 precedents (control holds).
+`frf-fuzz precedent list` renders the bank, and
+`examples/precedent_engine_demo` prints PRECEDENT ENGINE DEMO PASS.
+
+Throughput on this development machine (8 workers, 10 s, single runs —
+§31: no performance conclusion from one run; Phase-1 numbers predate the
+Phase-2/3 per-execution observation machinery): ~40k exec/s with
+residual+precedent on, ~63k exec/s coverage-only, on the same target and
+build. The rate is dominated by the worker's per-execution cmp/sketch work
+and coordinator debug builds; Phase-5 (AVX2 hardening) optimizes only
+measured hot paths.
 
 ## Phase 4 — FRF + Gemel
 

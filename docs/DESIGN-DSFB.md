@@ -1,9 +1,12 @@
 # DSFB Integration Design (Phase 3)
 
-Verified against `dsfb-debug 0.1.0` and `dsfb-database 0.1.1` source
+Status: **implemented** — Phase 3 shipped the design below in
+`dsfb/debug_bridge.rs`, `dsfb/fuzz_bank.rs`, `scheduler/policy.rs`, and
+`precedent/` (see `ROADMAP.md`). Verified against `dsfb-debug 0.1.0` and
+`dsfb-database 0.1.1` source
 (`.phase0/forensics/REPORT-dsfb-debug-0.1.0.md`,
-`.phase0/forensics/REPORT-dsfb-database-0.1.1.md`). This document fixes the
-integration contract; Phase 3 implements it.
+`.phase0/forensics/REPORT-dsfb-database-0.1.1.md`). This document fixed the
+integration contract; the implemented deviations are recorded inline below.
 
 ## DSFB-Debug: structural substrate
 
@@ -17,16 +20,45 @@ features = ["std"] }` — zero transitive deps (verified from its lockfile).
 - **Level 0/1 (cheap, per interesting execution)**: the structural engine
   without detectors — `sign::compute_sign_tuple`, `sign::drift_persistence`,
   `grammar::evaluate_raw_grammar`, `grammar::hysteresis_confirm`,
-  `policy::apply_policy`. This is the no_std path.
-- **Level 1 full (promoted executions)**: `fusion::run_fusion_evaluation`
-  with `FusionConfig::ALL_DEFAULT` (205 detectors, `min_consensus = 3`) or a
-  subset via `detector_weight_overrides` (weight 0 removes a detector).
-  Cheaper tier: `FusionConfig::ALL_FOUR_DEFAULT` (scalar + cusum + ewma +
-  dsfb_structural). NOTE: `run_fusion_evaluation` runs the field twice
-  (replay self-check); if that 2x cost is unacceptable, call the individual
+  `dsa::compute_dsa_score`, `dsa::consistency_gate`, `policy::apply_policy`.
+  This is the no_std path, and the one Phase 3 implemented:
+  `dsfb/debug_bridge.rs` runs exactly this chain per admitted edge with
+  `SemanticDisposition::Unknown` only (I6), so DSFB's `Review` means
+  "structure present but unnamed".
+- **Level 1 full (promoted executions; NOT implemented)**: the design
+  offered `fusion::run_fusion_evaluation` with `FusionConfig::ALL_DEFAULT`
+  (205 detectors, `min_consensus = 3`) or a subset via
+  `detector_weight_overrides` (weight 0 removes a detector). Cheaper tier:
+  `FusionConfig::ALL_FOUR_DEFAULT` (scalar + cusum + ewma + dsfb_structural).
+  NOTE: `run_fusion_evaluation` runs the field twice (replay self-check);
+  if that 2x cost is unacceptable, call the individual
   `incumbent_baselines::*` functions directly (all pub, uniform shape) and
   read the thread-local `LAST_WIN_ALERTS` immediately after each call, same
-  thread.
+  thread. Phase 3 calls the free functions directly and bypasses DSFB-
+  Debug's `evaluate_signal` bank lookup, so production-debugging motif
+  names never appear (I6).
+
+### Implemented substrate (Phase 3 deviations)
+
+- One `LineageSubstrate` per ROOT: all mutator families of a root share one
+  admitted-edge behavioral stream (admission order). The per-(root,
+  mutator) variant was a Phase-3 finding and was dropped — fragmented
+  streams never calibrated an envelope.
+- Declared calibration law: the first `calibration_windows` (8) axis
+  windows fix the axis mean and rho = max(3 sigma, 2 * span), so values
+  inside the already-observed span can never be misread as structural.
+- An axis whose calibration segment never moves is a discrete/step axis:
+  envelope grammar is unavailable (`calibrated = false`), verdicts stay
+  Silent, and frf-fuzz's discrete state-change classes interpret it
+  instead — DSFB never hallucinates envelope violations on step axes.
+- Boundary density is real: computed over the recent raw-grammar ring
+  (`drift_window` windows) and fed to `dsa::compute_dsa_score`. DSFB-
+  Debug's own `evaluate_signal` hardcodes boundary density 0.0 there, with
+  a comment; the free-function chain does not.
+- Axis verdicts are integer-only (enum codes, direction class, magnitude
+  bucket; no f64 in canonical payloads). They are durable per structural
+  edge as `Family::StructuralVerdict` (0x0D); closed structural episodes
+  persist as `Family::StructuralEpisode` (0x0E).
 
 ### Unknown handling (the load-bearing discipline)
 
@@ -52,13 +84,15 @@ morphology identity from the enums/masks (`GrammarState`, `ReasonCode`,
 - BTreeMap only — no HashMap iteration-order hazards.
 - `run_evaluation` caps at 8192 cells; batch sizes must respect that.
 
-## FuzzSemanticBank (frf-fuzz-owned)
+## FuzzSemanticBank (frf-fuzz-owned; implemented in `dsfb/fuzz_bank.rs`)
 
 frf-fuzz implements its own fuzz-specific semantic bank rather than reusing
-DSFB-Debug's production-debugging motif names:
+DSFB-Debug's production-debugging motif names. The implemented bank
+classifies substrate axis verdicts plus the morphology signature from
+deterministic integer evidence (no floats, no probabilities):
 
-- Candidate structural classes (descriptions, not causes):
-  ComparisonConvergence, ResidualLocalization, AllocationCreep,
+- Named structural classes (descriptions, not causes; the 13 shipped
+  classes): ComparisonConvergence, ResidualLocalization, AllocationCreep,
   StateDepthExpansion, ParserStateInstability, OutputTopologyShift,
   ErrorVariantMigration, RetryEscalation, ScheduleSensitivity,
   BoundaryGrazing, AbruptBehavioralSlew, PersistentBehavioralDrift,
@@ -71,7 +105,33 @@ DSFB-Debug's production-debugging motif names:
   rank, then lower index) and gate structure (zero-tier filter, witness-tier
   gate, margin gate, confuser gate, named-witness gate) with its own motif
   table.
+- Scoring is deterministic integer + specificity tier, with an ambiguity
+  guard: a same-score same-tier rival keeps the result `Structured +
+  Unknown` instead of picking an arbitrary winner.
+- Axis roles are assigned from the registered signal schema (name/unit
+  keywords, `role_of`); a class whose context predicate demands a role
+  refuses when the involved axes carry no declared role.
 - `Structured + Unknown` remains a valid terminal state throughout.
+
+## Precedent probes (implemented, Phase 3)
+
+Precedent semantics shipped in `precedent/` (`model`, `matching`, `probe`,
+`admission`); see `ARCHITECTURE.md` §14 for the durable object.
+
+- Matching is deterministic shape-subsumption inside a lead window: the live
+  signature must carry every profile axis with the same direction, agree on
+  the comparison-convergence / state-change classes, and belong to the same
+  mutator family, at a depth past the profile but inside the lead window.
+- Falsifiable probe recipes evaluate to Support / Contradict / Ambiguous; a
+  direct contradiction (the axis never moved at all) flips the precedent's
+  status, and so do three partial contradictions.
+- The first support confirms a Candidate; contradicted precedents are never
+  scheduled again and are never deleted (I10).
+- Admission happens only from real terminal observations; nothing is
+  admitted from interpretation alone.
+- Matched lineages are scheduled as DISCRIMINATE (the precedent declares a
+  confuser) or FALSIFY (no confuser) probe batches through the bounded
+  probe queue (`scheduler/policy.rs`).
 
 ## DSFB-Database: the architectural lesson only
 

@@ -11,16 +11,20 @@ FRF determines whether promoted discoveries are evidence.
 Gemel remembers what those discoveries meant across software evolution.
 ```
 
-Status: **Phases 0-2 complete** — a usable, deterministic fuzzer with
+Status: **Phases 0-3 complete** — a usable, deterministic fuzzer with
 coverage + compare guidance AND residual-guided fuzzing: target-defined
 semantic signals, mutation residuals, regime episodes (Stable → Drift →
 InEpisode → Recovering with deterministic close), inspectable morphology
 signatures with a Structured-Unknown discipline, EXPLORE/AMPLIFY
 scheduling, counterfactual boundary witnesses with two-sided minimization,
-and deterministic run tapes. Persistent instrumented workers, a
-content-addressed corpus, crash recovery without per-execution IPC, and the
-`init/add/build/run/replay/tmin/cmin/boundary/inspect/report/fsck` surface.
-See `docs/ROADMAP.md` for the phase plan.
+and deterministic run tapes. Phase 3 adds DSFB endoduction: the real
+`dsfb-debug` 0.1.0 substrate (structural verdicts and episodes), the
+FuzzSemanticBank's fuzz-specific classes, a durable precedent bank with
+falsifiable probes, and DISCRIMINATE/FALSIFY scheduling. Persistent
+instrumented workers, a content-addressed corpus, crash recovery without
+per-execution IPC, and the
+`init/add/build/run/replay/tmin/cmin/boundary/inspect/report/fsck/precedent`
+surface. See `docs/ROADMAP.md` for the phase plan.
 
 ## The idea in one paragraph
 
@@ -41,16 +45,19 @@ cargo install frf-fuzz
 cd my-project
 # add the dependency (the fuzz target links only the tiny target-runtime):
 #   [dependencies]
-#   frf-fuzz = { version = "0.2", default-features = false, features = ["target-runtime"] }
+#   frf-fuzz = { version = "0.3", default-features = false, features = ["target-runtime"] }
 
 cargo frf-fuzz init
 cargo frf-fuzz add parser      # creates src/bin/frf_fuzz_parser.rs
 cargo frf-fuzz build parser    # pinned-nightly instrumented build
 cargo frf-fuzz run parser      # spawns N persistent workers and fuzzes
 
-# residual-guided tools:
-cargo frf-fuzz run parser --residual off   # coverage-only ablation
-cargo frf-fuzz boundary <finding-id>       # two-sided minimization
+# residual-guided / endoductive tools:
+cargo frf-fuzz run parser --residual off      # coverage-only ablation
+cargo frf-fuzz run parser --precedent on --discriminate-weight <w> --falsify-weight <w>
+cargo frf-fuzz boundary <finding-id>          # two-sided minimization
+cargo frf-fuzz precedent list                 # renders the precedent bank
+cargo frf-fuzz precedent show <id>            # detail for one precedent
 ```
 
 A generated target is a normal binary in your existing crate:
@@ -79,7 +86,7 @@ sh scripts/golden_demo.sh
 
 ## Requirements
 
-* Coordinator: stable Rust >= 1.85 (MSRV), a C compiler (gemel's bundled
+* Coordinator: stable Rust >= 1.98 (MSRV), a C compiler (gemel's bundled
   sqlite).
 * Instrumented fuzz target: the pinned nightly
   (`nightly-2026-07-24`; `rustup toolchain install nightly-2026-07-24`) —
@@ -95,9 +102,9 @@ sh scripts/golden_demo.sh
 |---|---|---|
 | 0 | Specification / forensic spikes | **DONE** |
 | 1 | Minimum useful fuzzer (init/add/build/run, workers, corpus, crashes, replay, tmin, cmin, inspect, report, fsck) | **DONE** |
-| 2 | Residual-guided fuzzing (signals, residuals, regimes, morphology, boundaries, tapes) | next |
-| 3 | DSFB endoduction (FuzzSemanticBank, precedents, probes) | planned |
-| 4 | FRF + Gemel bridges | planned |
+| 2 | Residual-guided fuzzing (signals, residuals, regimes, morphology, boundaries, tapes) | **DONE** |
+| 3 | DSFB endoduction (FuzzSemanticBank, precedents, probes) | **DONE** |
+| 4 | FRF + Gemel bridges | next |
 | 5-8 | AVX2 hardening, database specialization, GPU, scientific evaluation | planned |
 
 ## The two planes

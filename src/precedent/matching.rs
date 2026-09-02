@@ -9,7 +9,8 @@
 //! terminal depth). This is the deterministic recognition of a historically
 //! observed structural prefix (master prompt §39): never a probability, never
 //! causal attribution — only "this shape family was observed before, and its
-//! historical continuations include <terminal>".
+//! historical continuations include its terminal class (documented in the
+//! precedent's continuation).
 //!
 //! Matching deliberately permits a DIFFERENT root than the precedent's origin
 //! lineage: the same structural shape on another seed is the interesting

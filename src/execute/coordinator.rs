@@ -216,8 +216,11 @@ struct CampaignState {
     probes: BTreeMap<u64, ProbeEntry>,
     /// Deterministic probe ordinal counter.
     probe_seq: u64,
-    /// Probes currently executing: (precedent revision id, matched root).
-    probe_inflight: std::collections::BTreeSet<(ContentId, ContentId)>,
+    /// Probes currently executing, keyed by the matched lineage
+    /// (root, mutator, profile identity) — never by revision id (revisions
+    /// change on every update; the key must stay stable or the set would
+    /// accumulate stale entries).
+    probe_inflight: std::collections::BTreeSet<(ContentId, u16, u64)>,
     /// Global admission sequence (checkpointed).
     admission_seq: u64,
     /// The regime configuration (campaign-constant).
@@ -698,9 +701,7 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
                     entry.seq,
                 );
                 state.probes_dispatched = state.probes_dispatched.saturating_add(1);
-                state
-                    .probe_inflight
-                    .insert((entry.precedent_id, entry.root));
+                state.probe_inflight.insert(probe_key(&entry));
                 probe_entry = Some(entry);
                 (probe_entry.as_ref().unwrap().frontier, plan)
             } else {
@@ -1316,7 +1317,14 @@ fn process_result(
                 }
                 let bv = classify_evidence(&ev);
                 let code = bv.motif().map(|m| m.code()).unwrap_or(0);
-                if code != 0 {
+                // Log only class CHANGES (the trajectory entered a new
+                // named regime), never every edge of a sustained regime.
+                let prev = state
+                    .lineages
+                    .get(&key)
+                    .map(|ls| ls.last_class)
+                    .unwrap_or(0);
+                if code != 0 && code != prev {
                     eprintln!(
                         "[campaign] bank: depth={} class={} axes={:#x}",
                         generation,
@@ -1434,6 +1442,17 @@ fn process_result(
 /// enqueue probe orders (bounded). Never writes to the store; all queue
 /// state is in-memory (a probe queue is disposable campaign state — lost on
 /// restart, unlike precedent revisions).
+/// The stable in-flight key of a probe: (matched root, mutator, profile
+/// identity). Revision ids are NOT used (they change on every precedent
+/// update, which would leak stale keys into the in-flight set).
+fn probe_key(entry: &ProbeEntry) -> (ContentId, u16, u64) {
+    (
+        entry.root,
+        entry.precedent.mutator,
+        entry.precedent.profile.profile_identity(),
+    )
+}
+
 fn enqueue_precedent_probes(
     state: &mut CampaignState,
     sig: &MorphologySignature,
@@ -1459,13 +1478,18 @@ fn enqueue_precedent_probes(
             continue;
         };
         state.precedent_matches = state.precedent_matches.saturating_add(1);
-        if state.probe_inflight.contains(&(pid, *root)) {
+        // One probe per (matched lineage, precedent family): bounded by the
+        // in-flight set and one queued entry per family+root.
+        if state
+            .probe_inflight
+            .contains(&(*root, p.mutator, p.profile.profile_identity()))
+        {
             continue;
         }
         if state
             .probes
             .values()
-            .any(|e| e.precedent_id == pid && e.root == *root)
+            .any(|e| e.root == *root && e.mutator == p.mutator)
         {
             continue;
         }
@@ -1547,7 +1571,7 @@ fn record_probe_result(
     let direct = crate::precedent::contradiction_weight(&recipe, &result.signal_summary)
         == crate::precedent::ContradictionWeight::Direct;
     persist_probe_update(store, state, &current, pid, outcome, evidence, direct)?;
-    state.probe_inflight.remove(&(pid, entry.root));
+    state.probe_inflight.remove(&probe_key(entry));
     eprintln!(
         "[campaign] probe outcome: {} axis={} moved={} run={} execs={}",
         outcome.name(),
@@ -1585,7 +1609,7 @@ fn record_probe_crash(store: &Store, state: &mut CampaignState, entry: &ProbeEnt
         evidence,
         false,
     )?;
-    state.probe_inflight.remove(&(pid, entry.root));
+    state.probe_inflight.remove(&probe_key(entry));
     eprintln!(
         "[campaign] probe order crashed: continuation confirmed for precedent {}",
         short_hex8(&pid)

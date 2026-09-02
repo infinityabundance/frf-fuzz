@@ -1,34 +1,48 @@
 # frf-fuzz Compatibility
 
-Status: Phase 0. This document records the empirically verified toolchain
-matrix and the flag sets the instrumented target build uses. Every claim here
-was reproduced on this machine during Phase 0; the commands live in
+Status: Phase 3. This document records the empirically verified toolchain
+matrix and the flag sets the instrumented target build uses. The claims were
+first reproduced on this machine during Phase 0 and re-verified in Phase 3
+after the MSRV raise and nightly re-pin; the commands live in
 `.phase0/spikes/` and `scripts/nightly_spike.sh`.
 
 ## 1. Coordinator
 
-* Stable Rust >= 1.85 (edition 2021), any later stable.
-* Verified: `cargo +1.85.0 test` passes with default features AND with
+* Stable Rust >= 1.98 (edition 2021, `rust-version = "1.98"` in
+  Cargo.toml), any later stable.
+* Verified: `cargo +1.98.0 test` passes with default features AND with
   `--no-default-features --features target-runtime`.
+* The coordinator MSRV was raised to 1.98 during Phase 3 by explicit user
+  decision (use the latest stable rustc), not by dependency pressure; the
+  instrumented nightly was re-pinned and re-verified accordingly (rustc
+  1.99.0-nightly satisfies the `rust-version` 1.98 requirement that Cargo
+  now enforces).
 * The coordinator builds with whatever stable toolchain is installed; the
   `doctor` verifies >= MSRV at runtime.
 
 ## 2. Instrumented fuzz target — the pinned nightly
 
 The instrumented target build requires nightly (SanitizerCoverage +
-sanitizer flags). The pin is **`nightly-2026-04-21`**:
+sanitizer flags). The pin is **`nightly-2026-07-24`**:
 
 ```
-rustc 1.97.0-nightly (66da6cae1a6f12e9585493ab8f8f19cf753091fd 2026-04-20)
-LLVM version: 22.1.2
+rustc 1.99.0-nightly (89c61a754 2026-07-23)
+LLVM version: 22.1.8
 ```
+
+The pin was re-verified and re-pinned during Phase 3 after the MSRV raise:
+the previous pin's rustc sat below 1.98, which Cargo refuses for a crate
+with `rust-version = "1.98"`; the instrumented flag set was re-proven
+end-to-end on the new pin by `scripts/nightly_spike.sh` and
+`scripts/golden_demo.sh`.
 
 `frf-fuzz doctor` verifies the requested nightly against this identity
 (`DEFAULT_PINNED_NIGHTLY` / `PINNED_NIGHTLY_*` in `src/lib.rs`) and warns on
 mismatch; campaign metadata records the actual identity. A mismatched
 nightly is never used silently.
 
-Nightlies verified by the Phase-0 probe (sancov-module + ASan flag set):
+Nightlies verified with the sancov-module + ASan flag set (the Phase-0
+probe list; the pinned row re-verified in Phase 3 after the MSRV raise):
 
 | nightly | rustc | LLVM | sancov-module |
 |---|---|---|---|
@@ -39,7 +53,7 @@ Nightlies verified by the Phase-0 probe (sancov-module + ASan flag set):
 | nightly-2025-11-08 | 1.93.0-nightly | 21.1.3 | works |
 | nightly-2025-11-21 | 1.93.0-nightly | 21.1.5 | works |
 | nightly-2025-11-25 | 1.93.0-nightly | 21.1.5 | works |
-| nightly-2026-04-21 | 1.97.0-nightly | 22.1.2 | works (pinned) |
+| nightly-2026-07-24 | 1.99.0-nightly | 22.1.8 | works (pinned) |
 
 ## 3. The instrumented build — flag sets
 
@@ -57,7 +71,7 @@ RUSTFLAGS="-Cpasses=sancov-module \
   -Cdebug-assertions=yes \
   -Coverflow-checks=yes \
   -Clto=off"
-cargo +nightly-2026-04-21 rustc --target <triple> --bin <target> -- -Cpanic=abort
+cargo +nightly-2026-07-24 rustc --target <triple> --bin <target> -- -Cpanic=abort
 ```
 
 Verified end-to-end by `examples/sancov_demo`: counter registration, cmp
@@ -75,7 +89,7 @@ RUSTFLAGS="-Zsanitizer=address \
   -Cdebug-assertions=yes \
   -Coverflow-checks=yes \
   -Clto=off"
-cargo +nightly-2026-04-21 rustc --target <triple> --bin <target> -- -Cpanic=abort
+cargo +nightly-2026-07-24 rustc --target <triple> --bin <target> -- -Cpanic=abort
 ```
 
 Verified: `examples/asan_crash` triggers a real ASan report.
@@ -205,9 +219,10 @@ authoritative cross-check.
 
 CubeCL will be admitted only if: CPU == CUDA == ROCm bit-for-bit, repeated
 GPU runs deterministic, compile/startup cost acceptable, optional feature
-does not break the Rust-1.85 default build, no unreasonable dependency
+does not break the Rust-1.98 default build, no unreasonable dependency
 contamination, measured speedup on realistic batch sizes. cudarc (CUDA
-11.4..13.x) and rocmrc (younger) are the fallback adapters. No MSRV raise.
+11.4..13.x) and rocmrc (younger) are the fallback adapters. The GPU work
+itself must not force a further MSRV raise.
 
 ## 7. Database (Phase 6 gates)
 

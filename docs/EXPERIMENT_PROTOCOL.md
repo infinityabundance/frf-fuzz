@@ -44,6 +44,11 @@ commands are in `PHASE0_FINDINGS.md` and `COMPATIBILITY.md`.
 | MSRV 1.85 matrix (default + target-runtime) | PASS | `cargo +1.85.0 test` |
 | whole feature matrix compiles on 1.85 | PASS | coordinator build + tests |
 
+Phase 3 raised the coordinator MSRV to 1.98 (current stable; deliberate
+decision) and re-verified the matrix there; the two 1.85 rows above record
+the same checks at the Phase-0 floor (`COMPATIBILITY.md` holds the current
+toolchain record).
+
 ## 2. Mandatory ablations (Phase 8)
 
 Never publish a performance or effectiveness conclusion from one run or one
@@ -134,6 +139,29 @@ Residual systems can hallucinate structure in noise. Mandatory controls:
   distinguishable by its discriminating probe)
 
 Failure to reproduce is PRESERVED, not discarded.
+
+### Phase 3 negative controls — implemented
+
+The Phase-3 endoduction machinery ships its controls as engine-level tests
+in `tests/endoduction.rs` (coordinator feature): a noise-only lineage names
+nothing (in-span jitter stays Silent / Unknown); threshold elasticity holds
+(shrink the same evidence and the class collapses to Unknown); two
+independent substrates replaying the same tape agree bit-for-bit while a
+shuffled stream does not reproduce the same stable episode; a precedent
+created from a real terminal lineage matches, its first support confirms
+it, and a direct contradiction flips it to Contradicted while earlier
+revisions are retained; the golden-demo marker-depth ladder names its class
+through the real DSFB substrate; schema-derived axis roles are
+deterministic.
+
+The golden-demo control (`scripts/golden_demo.sh`) verifies the coverage-
+only store forms 0 precedents while the residual-on store forms its durable
+precedent family.
+
+The ablation switches are now live: `--residual off` degenerates to
+coverage-only, `--precedent off` disables matching/probes, and the per-class
+weights (`--explore-weight`, `--amplify-weight`, `--discriminate-weight`,
+`--falsify-weight`) tune the scheduling ladder for the §2 ablations.
 
 ## 6. The golden demonstration target (Phase 1 acceptance; spec §34)
 

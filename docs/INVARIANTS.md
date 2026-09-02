@@ -154,7 +154,9 @@ reserved and dependency-free in Phase 0).
 
 * Code: Cargo feature matrix; `is_x86_feature_detected!`-guarded AVX2.
 * Verified: `cargo build --no-default-features --features target-runtime`
-  and `cargo +1.85.0 test` pass.
+  and `cargo +1.98.0 test` pass (the matrix MSRV was raised to 1.98 during
+  Phase 3 by deliberate decision; Phase-0 records of the 1.85 verification
+  remain in EXPERIMENT_PROTOCOL.md as historical evidence).
 
 ## Unsafe policy
 

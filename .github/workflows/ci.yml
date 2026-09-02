@@ -42,6 +42,8 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Format check
         run: cargo fmt --check
+      - name: Precedent-engine demo (acceptance items 10-12)
+        run: cargo run --quiet --example precedent_engine_demo | tee /tmp/precedent-engine.out && grep -q 'PRECEDENT ENGINE DEMO PASS' /tmp/precedent-engine.out
 
   instrumentation:
     name: Nightly instrumentation spike
@@ -95,5 +97,5 @@ jobs:
       - name: Build + doctor --json
         run: |
           cargo build
-          cargo run --quiet -- doctor --json | python3 -m json.tool > /dev/null
-          cargo run --quiet -- version
+          cargo run --quiet --bin frf-fuzz -- doctor --json | python3 -m json.tool > /dev/null
+          cargo run --quiet --bin frf-fuzz -- version
