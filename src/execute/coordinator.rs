@@ -32,6 +32,10 @@ use crate::dsfb::regime::{RegimeConfig, RegimeEpisode, RegimeObserver};
 use crate::error::{Error, Result};
 use crate::execute::finding::{self, Finding, FindingKind, ReplayStatus};
 use crate::execute::worker_process::{SanitizerMode, WorkerEvent, WorkerHandle};
+use crate::frf_bridge::{
+    self, AuthoritySpec, CourtQuestion, VerificationOutcome, VerificationRecord,
+};
+use crate::gemel_bridge::{self, BoundaryKind};
 use crate::id::ContentId;
 use crate::mutation::{CmpHit, CounterRng, MutationCoordinate, MutationInput};
 use crate::observe::residual::MutationResidual;
@@ -117,6 +121,23 @@ pub struct CampaignConfig {
     pub llvm_version: String,
     /// The exact instrumented-build flags.
     pub instrument_flags: Vec<String>,
+    /// Optional FRF authority: when configured, promoted (replay-confirmed)
+    /// crash/timeout findings are court-verified at promotion (Level 2) and
+    /// the real FRF receipt id is retained verbatim (Phase 4).
+    pub authority: Option<AuthoritySpec>,
+    /// The court-question binding used for every verification court.
+    pub question: CourtQuestion,
+    /// The verification candidate executable (must honor the
+    /// `--frf-fuzz-fixture <path>` interface; an instrumented frf-fuzz
+    /// target binary does). Default: the fuzz target binary itself — for
+    /// ASan campaigns, point this at a non-ASan build of the same target.
+    pub verification_candidate: Option<PathBuf>,
+    /// Compile an FRF baseline claim after verification (explicit opt-in;
+    /// disposes the run's residuals as Intentional first).
+    pub verify_claim: bool,
+    /// Publish durable boundaries into a Gemel repository when one is
+    /// present (campaign checkpoints, verified findings, precedents).
+    pub gemel: bool,
 }
 
 /// Campaign summary (reported by the CLI).
@@ -166,6 +187,14 @@ pub struct CampaignSummary {
     pub probe_contradictions: u64,
     /// Ambiguous probe outcomes.
     pub probe_ambiguous: u64,
+    /// FRF verification records persisted (Phase 4).
+    pub frf_verifications: u64,
+    /// FRF-verified findings (receipts emitted; Phase 4).
+    pub frf_verified: u64,
+    /// FRF verification attempts that failed/refused (preserved, Phase 4).
+    pub frf_failed: u64,
+    /// Local Gemel boundary records written (Phase 4).
+    pub gemel_boundaries: u64,
 }
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -242,6 +271,21 @@ struct CampaignState {
     probe_supports: u64,
     probe_contradictions: u64,
     probe_ambiguous: u64,
+    /// FRF verification records persisted (Phase 4).
+    frf_verifications: u64,
+    /// FRF-verified findings (receipts emitted).
+    frf_verified: u64,
+    /// FRF verification attempts that failed (preserved).
+    frf_failed: u64,
+    /// Local Gemel boundary records written.
+    gemel_boundaries: u64,
+    /// Inputs already court-verified THIS campaign (BLAKE3 over the input
+    /// bytes). FRF courts are expensive (they hash the full candidate and
+    /// run both sides); a crash flood of identical inputs must not re-run
+    /// the same court per finding — the first attempt's durable record
+    /// covers every later occurrence (same input + same authority + same
+    /// question = same court).
+    verified_inputs: std::collections::BTreeSet<[u8; 32]>,
     /// Schema digest already stored (content-addressed; ref recorded).
     schema_ref: Option<ContentId>,
     /// The target's signal schema (for inspection names).
@@ -332,6 +376,11 @@ impl CampaignState {
             probe_supports: 0,
             probe_contradictions: 0,
             probe_ambiguous: 0,
+            frf_verifications: 0,
+            frf_verified: 0,
+            frf_failed: 0,
+            gemel_boundaries: 0,
+            verified_inputs: std::collections::BTreeSet::new(),
             schema_ref: None,
             schema: None,
             build: build_digest(
@@ -560,6 +609,25 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
     let campaign_payload = encode_campaign(cfg)?;
     let campaign_id = store.put(Family::Campaign, &campaign_payload)?;
     refs::set_ref(&cfg.store_root, "campaign-current", &campaign_id)?;
+
+    // ---- Phase 4: Gemel campaign-created boundary ----
+    // Level-3 durable boundary only; standalone mode writes nothing. A
+    // Gemel-side failure is recorded locally, never fatal (I14).
+    if cfg.gemel {
+        if let Some(id) = gemel_bridge::publish_boundary(
+            &store,
+            &gemel_project_root(cfg),
+            BoundaryKind::CampaignCreated,
+            campaign_id,
+            None,
+        )? {
+            state.gemel_boundaries = state.gemel_boundaries.saturating_add(1);
+            eprintln!(
+                "[campaign] gemel boundary campaign-created -> {}",
+                id.to_hex()
+            );
+        }
+    }
 
     // ---- dictionary ----
     let mut dictionary = cfg.initial_dictionary.clone();
@@ -898,6 +966,25 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
     let checkpoint_id = store.put(Family::Checkpoint, &checkpoint_payload)?;
     refs::set_ref(&cfg.store_root, "checkpoint-current", &checkpoint_id)?;
 
+    // ---- Phase 4: Gemel campaign-completed boundary ----
+    // Level-3 durable boundary on every exit path (graceful or not); the
+    // local checkpoint above is always the durable continuation record.
+    if cfg.gemel {
+        if let Some(id) = gemel_bridge::publish_boundary(
+            &store,
+            &gemel_project_root(cfg),
+            BoundaryKind::CampaignCompleted,
+            campaign_id,
+            None,
+        )? {
+            state.gemel_boundaries = state.gemel_boundaries.saturating_add(1);
+            eprintln!(
+                "[campaign] gemel boundary campaign-completed -> {}",
+                id.to_hex()
+            );
+        }
+    }
+
     Ok(CampaignSummary {
         campaign_id,
         executions,
@@ -921,7 +1008,52 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
         probe_supports: state.probe_supports,
         probe_contradictions: state.probe_contradictions,
         probe_ambiguous: state.probe_ambiguous,
+        frf_verifications: state.frf_verifications,
+        frf_verified: state.frf_verified,
+        frf_failed: state.frf_failed,
+        gemel_boundaries: state.gemel_boundaries,
     })
+}
+
+/// The Gemel discovery root for a campaign: the project directory holding
+/// the store (the store root's parent), where the developer's `.gemel`
+/// repository lives.
+fn gemel_project_root(cfg: &CampaignConfig) -> std::path::PathBuf {
+    cfg.store_root
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| cfg.store_root.clone())
+}
+
+/// Publish one durable boundary into Gemel when the campaign has it enabled
+/// and a repository is present. Standalone mode writes nothing; a Gemel-side
+/// failure is recorded locally and counted, never fatal (I14).
+fn gemel_publish(
+    state: &mut CampaignState,
+    store: &Store,
+    kind: BoundaryKind,
+    subject: ContentId,
+    detail: Option<&str>,
+) -> Result<()> {
+    if !state.cfg.gemel {
+        return Ok(());
+    }
+    if let Some(rec_id) = gemel_bridge::publish_boundary(
+        store,
+        &gemel_project_root(&state.cfg),
+        kind,
+        subject,
+        detail,
+    )? {
+        state.gemel_boundaries = state.gemel_boundaries.saturating_add(1);
+        eprintln!(
+            "[campaign] gemel boundary {} subject={} record={}",
+            kind.name(),
+            subject,
+            rec_id.to_hex()
+        );
+    }
+    Ok(())
 }
 
 /// The planned start index of a plan (the coordinator already advanced
@@ -1649,7 +1781,13 @@ fn persist_probe_update(
     match outcome {
         ProbeOutcome::Support => state.probe_supports = state.probe_supports.saturating_add(1),
         ProbeOutcome::Contradict => {
-            state.probe_contradictions = state.probe_contradictions.saturating_add(1)
+            state.probe_contradictions = state.probe_contradictions.saturating_add(1);
+            // Phase 4: a falsified precedent is negative knowledge. Publish
+            // it to Gemel as a Residual (best-effort; the local record
+            // makes failures observable) — I10: never deleted.
+            if state.cfg.gemel {
+                gemel_publish(state, store, BoundaryKind::FalsifiedPrecedent, new_id, None)?;
+            }
         }
         ProbeOutcome::Ambiguous => state.probe_ambiguous = state.probe_ambiguous.saturating_add(1),
     }
@@ -1751,6 +1889,11 @@ fn maybe_admit_precedent(
         terminal_kind.name(),
         terminal_depth
     );
+    // Phase 4: a promoted structural precedent is a durable boundary
+    // (Level 3). Best-effort; the local record makes failures observable.
+    if state.cfg.gemel {
+        gemel_publish(state, store, BoundaryKind::PrecedentAdmitted, id, None)?;
+    }
     Ok(())
 }
 
@@ -1993,7 +2136,49 @@ fn handle_worker_death(
         // admitted to the corpus (their feature sets were never measured —
         // the worker died mid-window — so they are useless mutation parents;
         // the Finding object already retains the input, I10).
-        classify_and_replay(cfg, store, lane, &input, &id, override_seq)?;
+        let (replay, final_id) = classify_and_replay(cfg, store, lane, &input, &id, override_seq)?;
+
+        // ---- Phase 4: FRF verification at promotion (Level 2) ----
+        // Only replay-confirmed findings are court-verified: a finding that
+        // does not reproduce standalone would show no differential under
+        // the FRF harness, which replay already recorded. With no authority
+        // configured the finding stays Unverified (derived, never
+        // fabricated — acceptance item 16).
+        if replay == ReplayStatus::Reproduced {
+            if let Some(authority) = cfg.authority.as_ref() {
+                let candidate = cfg
+                    .verification_candidate
+                    .clone()
+                    .unwrap_or_else(|| cfg.target_bin.clone());
+                let detail = attempt_frf_verification(
+                    store,
+                    state,
+                    &final_id,
+                    &finding.input,
+                    authority,
+                    &candidate,
+                )?;
+                // Gemel: a VERIFIED finding is a durable boundary bound to
+                // the current state (best-effort; recorded locally). A
+                // failed/refused verification publishes nothing to Gemel —
+                // the durable Failed record in the local store is the
+                // evidence (I10, I14).
+                if let Some(detail) = detail {
+                    if cfg.gemel
+                        && gemel_bridge::publish_boundary(
+                            store,
+                            &gemel_project_root(cfg),
+                            BoundaryKind::FindingVerified,
+                            final_id,
+                            Some(&detail),
+                        )?
+                        .is_some()
+                    {
+                        state.gemel_boundaries = state.gemel_boundaries.saturating_add(1);
+                    }
+                }
+            }
+        }
     } else {
         eprintln!(
             "[campaign] worker lane {lane} died without an attributable candidate (seq {seq})"
@@ -2070,6 +2255,11 @@ fn coord_to_discovery(coord: &MutationCoordinate) -> work_order::DiscoveryRecord
 
 /// Deliberately replay the finding input through a fresh worker to classify
 /// (crash vs timeout by replay timing) and confirm reproduction.
+/// Deliberately re-execute a finding's input on a fresh worker to classify
+/// it (crash/timeout reproduce as a death; a surviving run is a
+/// non-reproduction, preserved). Returns the replay status and the NEW
+/// finding revision id (objects are immutable; both revisions are retained,
+/// I10). The returned revision is the one FRF verification binds.
 fn classify_and_replay(
     cfg: &CampaignConfig,
     store: &Store,
@@ -2077,7 +2267,7 @@ fn classify_and_replay(
     input: &[u8],
     finding_id: &ContentId,
     override_seq: &mut BTreeMap<u16, u64>,
-) -> Result<()> {
+) -> Result<(ReplayStatus, ContentId)> {
     let mut w = spawn_worker(cfg, store, lane)?;
     let seq = override_seq.entry(lane).or_insert(0);
     let order = override_order(&cfg.policy, lane, *seq, input.to_vec());
@@ -2103,10 +2293,96 @@ fn classify_and_replay(
     finding.replay = outcome;
     let new_payload = finding::encode_finding(&finding)?;
     let new_id = store.put(Family::Finding, &new_payload)?;
-    let _ = new_id;
     let _ = w.send_shutdown();
     let _ = w.wait();
-    Ok(())
+    Ok((outcome, new_id))
+}
+
+/// Run the FRF verification court for one promoted finding and persist the
+/// durable verification record. Any failure — FRF refusal OR a hard
+/// configuration error (missing candidate, bad authority id) — becomes a
+/// `Failed` record with a deterministic note; the campaign never fails on
+/// verification (I14). Returns an evidence detail string for the Gemel
+/// boundary (the FRF run/receipt ids when present).
+fn attempt_frf_verification(
+    store: &Store,
+    state: &mut CampaignState,
+    finding_id: &ContentId,
+    input: &[u8],
+    authority: &AuthoritySpec,
+    candidate: &std::path::Path,
+) -> Result<Option<String>> {
+    // Crash-flood dedup: the same input (same authority + question, which
+    // are campaign-constant) produces the same court; the first attempt's
+    // durable record already covers it. Re-running the court per duplicate
+    // crash would serialize the campaign on FRF hashing/execution.
+    let input_digest: [u8; 32] = *ContentId::new(input).as_bytes();
+    if !state.verified_inputs.insert(input_digest) {
+        eprintln!(
+            "[campaign] FRF verification skipped for finding={} (input already court-verified this campaign)",
+            finding_id
+        );
+        return Ok(None);
+    }
+    let (ver_id, record) = match frf_bridge::verify_and_persist(
+        store,
+        finding_id,
+        authority,
+        &state.cfg.question,
+        candidate,
+        input,
+        state.cfg.verify_claim,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // A hard configuration error is still a durable (failed)
+            // verification attempt: the reason is preserved, never silent.
+            let rec = VerificationRecord {
+                finding: *finding_id,
+                authority_name: authority.name.clone(),
+                authority_version: authority.version.clone(),
+                outcome: VerificationOutcome::Failed,
+                run: None,
+                receipt: None,
+                claim: None,
+                note: Some(frf_bridge::bound_text(
+                    &format!("verification failed: {e}"),
+                    frf_bridge::MAX_NOTE_LEN,
+                )),
+            };
+            let payload = frf_bridge::encode_verification(&rec)?;
+            let id = store.put(Family::FindingVerification, &payload)?;
+            (id, rec)
+        }
+    };
+    state.frf_verifications = state.frf_verifications.saturating_add(1);
+    match record.outcome {
+        VerificationOutcome::Verified => {
+            state.frf_verified = state.frf_verified.saturating_add(1);
+            let receipt = record.receipt.clone().unwrap_or_default();
+            eprintln!(
+                "[campaign] FRF VERIFIED finding={} receipt={} record={}",
+                finding_id,
+                receipt,
+                ver_id.to_hex()
+            );
+            Ok(Some(format!(
+                "frf run {} receipt {}",
+                record.run.as_deref().unwrap_or(""),
+                receipt
+            )))
+        }
+        VerificationOutcome::Failed => {
+            state.frf_failed = state.frf_failed.saturating_add(1);
+            eprintln!(
+                "[campaign] FRF verification failed finding={} record={} note={}",
+                finding_id,
+                ver_id.to_hex(),
+                record.note.as_deref().unwrap_or("")
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Write the human-readable diagnostics sidecar next to a finding.

@@ -190,13 +190,81 @@ build. The rate is dominated by the worker's per-execution cmp/sketch work
 and coordinator debug builds; Phase-5 (AVX2 hardening) optimizes only
 measured hot paths.
 
-## Phase 4 — FRF + Gemel
+## Phase 4 — FRF + Gemel (DONE)
 
-- FRF promotion court (verified sequence in `docs/DESIGN-FRF-BRIDGE.md`),
-  receipt linkage, refusal preservation.
-- Gemel source-state binding, durable checkpoints, negative-knowledge
-  publication, revision tape replay, RevisionResidual
-  (`docs/DESIGN-GEMEL-BRIDGE.md`).
+- `src/frf_bridge.rs`: the epistemic-authority plane. Real `frf` 0.1.72
+  courts run in-process on promotion: authority admission (once; drift =
+  refusal with an actionable message), the court-question manifest (a strict
+  YAML emitter with no serde dependency, validated in tests against FRF's
+  own parser), `court::run_once(reuse=true)` for FRF-immutability-safe
+  idempotent evidence capture, `receipt::run` (the evidence id, retained
+  verbatim), and optional claim compilation (`--claim`/`--verify-claim`:
+  residuals disposed `Intentional`, baseline claim). Cwd is pinned to the FRF
+  store root during the court (stable capture environment identity).
+- `Family::FindingVerification` (0x0F): durable verification records
+  (finding id, authority, outcome, FRF run/receipt/claim ids, deterministic
+  bounded note). No authority => DERIVED `Unverified` — never fabricated
+  (acceptance item 16). A crash finding is `Verified` only when the court
+  observed >= 1 residual divergence; a parity receipt (0 residuals) is
+  `Failed` with the receipt preserved as evidence of non-reproduction (I10).
+- Campaign auto-verify: `run --authority <path> [--authority-name/-version]
+  [--verify-candidate <path>] [--verify-claim] [--question-id]
+  [--fixture-family] [--gemel on|off]`; replay-confirmed crash/timeout
+  findings are court-verified at promotion (Level 2) with a per-campaign
+  input dedup (a crash flood never re-runs one court per duplicate input).
+  Any court/refusal/config failure is persisted as `Failed` and never fails
+  the campaign (I14). The verification candidate is the fuzz target binary
+  itself via its new single-shot fixture mode.
+- `target_runtime/fixture.rs`: `frf_fuzz_<name> --frf-fuzz-fixture <path>`
+  runs the registered hooks exactly once over a file's bytes and exits —
+  the case-harness interface FRF courts execute (no environment required;
+  FRF runs sides with an empty env). Hot path untouched.
+- `src/gemel_bridge.rs`: `Repo::find` discovery (absent => standalone,
+  broken => recorded failure class), read-only source-state snapshots
+  (head-state/change/intent/trajectory/producer Gids verbatim), and durable
+  publications: campaign create/complete checkpoints
+  (`workflow::create_checkpoint`), verified-finding `Evidence`
+  (`court_receipt`) bound to the evaluated state (field 0x11) + `Claim`,
+  precedent-admission `Evidence` (`fuzz_result`), falsified-precedent
+  `Residual` (`expected_mismatch`) — negative knowledge. Every boundary
+  writes a local `Family::GemelBoundary` (0x10) record with the snapshot,
+  the published Gids, and the deterministic failure class, so Gemel-side
+  failures are observable and never silent (I14). No per-execution Gemel
+  writes (I5; verified by test + the golden demo's boundary counts).
+- `tape/revision.rs` + `Family::RevisionResidual` (0x11): revision tape
+  replay — the same tape's exact candidate re-executed through per-state
+  artifact binaries (instrumented targets built from the revisions) with
+  durable adjacent-pair objects (tape id, artifact BLAKE3 digests,
+  environment digests, termination statuses, signal observations) and the
+  typed R_V residual derived at decode. `frf-fuzz revision replay
+  <tape-or-finding-id> --state <label>=<binary> ...` (finding ids resolve
+  their campaign crash tape deterministically).
+- CLI/report/fsck: `verify`, `revision replay`; `run` banner states the
+  authority + gemel mode; summary/report count FRF verifications/verified/
+  failed and gemel boundaries; `inspect` decodes all three new families;
+  `fsck` validates verification-record -> finding links (+ FRF id shape),
+  gemel-boundary -> subject links (+ published-Gid presence), and
+  revision-pair -> tape links.
+- Demo/tests: `tests/phase4_frf_gemel.rs` (8 hermetic integration tests
+  running REAL FRF courts with script sides and REAL Gemel repositories
+  with head states: verified+idempotent receipts, non-reproduction =
+  Failed+preserved, derived-unverified, claim compilation, standalone
+  absence, state-bound evidence+claim publication, falsified-precedent
+  residual publication, revision-pair roundtrip); `examples/golden_authority.rs`
+  (the demo's clean reference) + `examples/phase4_gemel_init.rs` (demo repo
+  with a head state); `scripts/golden_demo.sh` stages 11-17 prove acceptance
+  items 15-17 live (real FRF-verified receipts at campaign promotion, gemel
+  checkpoints + evidence/claim, authority-less controls stay unverified,
+  idempotent CLI verify, revision tape replay, fsck-clean at every stage);
+  `scripts/cli_smoke.sh` exercises the new CLI surface.
+
+Measured on the golden-demo target (8 workers, 12 s campaign with an
+authority + Gemel repo): 1 crash found and FRF-VERIFIED with a real receipt
+(`reference=0 candidate=signal(6)` residual), 3 gemel boundary records
+(created + completed + finding-verified), store fsck-clean; the two
+authority-less control campaigns record zero verifications. FRF courts add
+wall-clock time only at crash promotion (Level 2; seconds per court on this
+machine) — never in the per-execution loop.
 
 ## Phase 5 — AVX2 Hardening
 

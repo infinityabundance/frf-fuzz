@@ -1,6 +1,6 @@
 # frf-fuzz Dependency Policy and Pin Record
 
-Status: Phase 0. Every dependency exists for a recorded reason. Versions are
+Status: Phase 4. Every dependency exists for a recorded reason. Versions are
 pinned (`=`) for integration-sensitive crates. The core default build stays
 small enough to audit; the target-runtime build is dependency-tiny.
 
@@ -11,8 +11,8 @@ small enough to audit; the target-runtime build is dependency-tiny.
 | `memmap2` | `=0.9.11` | 1.65 | always | The crash ledger's shared mapping between worker and coordinator. `map_mut` is an `unsafe fn` (mmap syscall boundary); it is the one documented unsafe zone in `execute/crash_ledger.rs`. |
 | `libc` | `=0.2.177` | ~1.63 | always | Worker-side Unix process controls: `setrlimit` (memory limits) and the `SIGALRM` timeout (`setitimer` + `signal`; glibc's `setitimer` is NOT exported by the libc crate for linux-gnu, so the single stable symbol is declared locally in `target_runtime/worker.rs`), plus the coordinator's SIGINT handler. Tiny, no transitive deps. |
 | `blake3` | `=1.8.7` | compatible within the 1.98 build (resolved by gemel 0.11.0's lock) | `coordinator` | Content identity (BLAKE3-256) for the object store and corpus. Chosen over SHA-256 for speed on the admission path. gated so the target-runtime build never links it. |
-| `frf` | `=0.1.72` | 1.85 | `coordinator` | Epistemic authority: court questions, receipts, claims, trajectories for promoted findings. No features exist; pulls clap/serde_yaml/tar/base64/sha2/libc unconditionally — the price of real evidence semantics, kept out of the target-runtime build. Its column value is its own declared MSRV; it compiles within the 1.98 build. |
-| `gemel` | `=0.11.0` | 1.85 | `coordinator` | Longitudinal engineering memory: durable boundary objects, state Gids, trajectories, negative knowledge. `rusqlite` bundled requires a C compiler at build time (documented in `doctor`). No features. |
+| `frf` | `=0.1.72` | 1.85 | `coordinator` | Epistemic authority: court questions, receipts, claims, trajectories for promoted findings (Phase 4: `src/frf_bridge.rs` runs real in-process courts at promotion; receipts retained verbatim). No features exist; pulls clap/serde_yaml/tar/base64/sha2/libc unconditionally — the price of real evidence semantics, kept out of the target-runtime build. Its column value is its own declared MSRV; it compiles within the 1.98 build. |
+| `gemel` | `=0.11.0` | 1.85 | `coordinator` | Longitudinal engineering memory: durable boundary objects, state Gids, trajectories, negative knowledge (Phase 4: `src/gemel_bridge.rs` publishes durable boundaries at campaign/verification/precedent points). `rusqlite` bundled requires a C compiler at build time (documented in `doctor`). No features. |
 | `dsfb-debug` | `=0.1.0`, `default-features=false, features=["std"]` | 1.75 | `coordinator` | Structural interpretation substrate (residual/sign/drift/slew/grammar/policy/episode + 205-detector fusion field). With this exact feature set it has ZERO transitive deps (verified from its lockfile). Its motif names are never applied to fuzz behavior (I6). |
 | `dsfb-database` | `=0.1.1`, `default-features=false` | 1.74 | `database` (optional) | Only for real database telemetry targets. With `default-features=false` it pulls no tokio/postgres/otel/plotters (verified). Generic fuzz residuals never become its `ResidualClass` (I7). |
 
@@ -29,8 +29,10 @@ of 1.85.
   exceeded the pre-Phase-3 1.85 contract; the crate borrows compositional
   ideas, not the crate.
 * **No serde/serde_json in the crate itself**: the protocol is binary; the
-  doctor's `--json` is hand-rolled and documented. (frf/gemel/dsfb-database
-  bring their own serde internally.)
+  doctor's `--json` and the FRF court manifest (Phase 4) are emitted by
+  strict hand-rolled writers validated in tests against FRF's own parser
+  (`frf_bridge::emit_manifest` + `manifest_parses_with_frfs_own_deserializer`).
+  (frf/gemel/dsfb-database bring their own serde internally.)
 * **No clap in frf-fuzz's own CLI yet**: the Phase-0 CLI is argv-adapter
   thin; Phase 1 may add clap after this policy is re-reviewed.
 * **No thiserror**: the crate error type is hand-rolled so its `Display` is

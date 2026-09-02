@@ -9,14 +9,14 @@
 //!   corpus edge (Phase 2).
 //! * [`TemporalResidual`] — R_T(k): observation(k) vs the declared/local
 //!   nominal regime of its lineage. Feeds the `RegimeObserver` (Phase 2).
-//! * *Authority residual* R_A(candidate, authority) — arrives with the FRF
-//!   bridge (Phase 4).
-//! * *Revision residual* R_V(Vn, Vn-1, tape) — arrives with the Gemel
-//!   revision replay (Phase 4).
-//!
-//! The two Phase-4 families are NOT stubbed here: shipping an empty
-//! abstraction that pretends to exist is forbidden (docs/ROADMAP.md). They
-//! are documented in the roadmap and will be added with their bridges.
+//! * *Authority residual* R_A(candidate, authority) — the FRF bridge's
+//!   differential (Phase 4). FRF itself owns the authority/candidate
+//!   semantics and residual dispositions (I4); frf-fuzz never recreates
+//!   them. The bridge retains FRF evidence ids verbatim instead.
+//! * [`RevisionResidual`] — R_V(Vn, Vn-1, tape): the typed behavioral
+//!   difference between two artifact observations of the SAME tape
+//!   candidate, computed by revision tape replay across Gemel revision
+//!   states (Phase 4).
 
 use crate::target_runtime::signals::{ResidualSketch, SignalVector, MAX_SIGNALS};
 
@@ -128,6 +128,71 @@ impl TemporalResidual {
     }
 }
 
+/// R_V: observation(Vn, tape) minus observation(Vn-1, tape).
+///
+/// The revision residual is the *same-tape* behavioral difference across two
+/// software revisions (Gemel states): same input bytes, same mutation
+/// coordinate, same observation surface — the only varying dimension is the
+/// artifact that executed. A nonzero delta is a program-side perturbation
+/// between the two states (a branch of development is a natural controlled
+/// experiment, docs/DESIGN-GEMEL-BRIDGE.md).
+///
+/// The shape mirrors [`MutationResidual`] — exact saturating per-signal
+/// deltas (`later` minus `earlier`) plus the bucketized sketch — but it is
+/// a SEPARATELY TYPED family: a revision difference is never flattened into
+/// a mutation difference or vice versa (master prompt §12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionResidual {
+    /// The later revision's recorded observation.
+    pub later: SignalVector,
+    /// The earlier revision's recorded observation.
+    pub earlier: SignalVector,
+    /// Exact saturating per-signal deltas (later - earlier).
+    pub deltas: [i64; MAX_SIGNALS],
+    /// Later-touched bitmask.
+    pub touched: u64,
+    /// Later-touched-but-earlier-untouched bitmask.
+    pub touched_new: u64,
+    /// Earlier-touched-but-later-untouched bitmask.
+    pub touched_lost: u64,
+    /// The bucketized sketch (cheap form of the same difference).
+    pub sketch: ResidualSketch,
+}
+
+impl RevisionResidual {
+    /// Compute the revision residual of one same-tape observation pair
+    /// (`later` revision vs `earlier` revision). The scalar semantics are
+    /// identical to the mutation residual's; only the semantic axis differs.
+    pub fn of(later: &SignalVector, earlier: &SignalVector) -> RevisionResidual {
+        let deltas = crate::target_runtime::signals::deltas(earlier, later);
+        RevisionResidual {
+            later: later.clone(),
+            earlier: earlier.clone(),
+            deltas,
+            touched: later.touched_mask(),
+            touched_new: later.touched_mask() & !earlier.touched_mask(),
+            touched_lost: earlier.touched_mask() & !later.touched_mask(),
+            sketch: ResidualSketch::of(earlier, later),
+        }
+    }
+
+    /// Bitmask of signals with any nonzero delta (the perturbed axes).
+    pub fn moved(&self) -> u64 {
+        let mut m = 0u64;
+        for i in 0..MAX_SIGNALS {
+            if self.deltas[i] != 0 {
+                m |= 1u64 << i;
+            }
+        }
+        m
+    }
+
+    /// Exact delta of one signal.
+    pub fn delta(&self, i: usize) -> i64 {
+        self.deltas[i]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +238,41 @@ mod tests {
         let r3 = TemporalResidual::of(5, 10, Some(12));
         assert_eq!(r3.deviation, -5);
         assert_eq!(r3.instantaneous, -7);
+    }
+
+    #[test]
+    fn revision_residual_mirrors_mutation_semantics() {
+        let mut earlier = SignalVector::new();
+        earlier.observe(SignalId(0), 100).unwrap();
+        earlier.observe(SignalId(1), 5).unwrap();
+        let mut later = SignalVector::new();
+        later.observe(SignalId(0), 90).unwrap();
+        later.observe(SignalId(2), 7).unwrap();
+        let r = RevisionResidual::of(&later, &earlier);
+        // Same arithmetic as MutationResidual::of(child, parent): the ONLY
+        // difference is the semantic axis (revision vs mutation).
+        let m = MutationResidual::of(&later, &earlier);
+        assert_eq!(r.deltas, m.deltas);
+        assert_eq!(r.delta(0), -10);
+        assert_eq!(r.delta(1), -5);
+        assert_eq!(r.delta(2), 7);
+        assert_eq!(r.touched_new, 1 << 2);
+        assert_eq!(r.touched_lost, 1 << 1);
+        assert_eq!(r.moved(), 0b111);
+        // Identical same-tape observations produce a zero residual: no
+        // program-side perturbation between the two revisions.
+        let zero = RevisionResidual::of(&earlier, &earlier);
+        assert_eq!(zero.moved(), 0);
+        assert!(zero.deltas.iter().all(|d| *d == 0));
+    }
+
+    #[test]
+    fn revision_residual_never_inverts_sign_on_wraparound() {
+        let mut earlier = SignalVector::new();
+        earlier.observe(SignalId(0), u64::MAX).unwrap();
+        let mut later = SignalVector::new();
+        later.observe(SignalId(0), 0).unwrap();
+        let r = RevisionResidual::of(&later, &earlier);
+        assert_eq!(r.delta(0), i64::MIN); // saturated, negative
     }
 }

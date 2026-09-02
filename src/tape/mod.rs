@@ -23,6 +23,7 @@
 
 pub mod model;
 pub mod replay;
+pub mod revision;
 
 pub use model::{
     build_digest, decode_tape, encode_tape, environment_digest, RunTape, TapeObservation,

@@ -61,6 +61,8 @@ pub fn run(args: &[String]) -> i32 {
         "replay" => finish("replay", cmd_replay(&args[1..])),
         "tmin" => finish("tmin", cmd_tmin(&args[1..])),
         "cmin" => finish("cmin", cmd_cmin(&args[1..])),
+        "verify" => finish("verify", cmd_verify(&args[1..])),
+        "revision" => finish("revision", cmd_revision(&args[1..])),
         "boundary" => finish("boundary", cmd_boundary(&args[1..])),
         "precedent" => finish("precedent", cmd_precedent(&args[1..])),
         "inspect" => finish("inspect", cmd_inspect(&args[1..])),
@@ -105,14 +107,23 @@ fn print_usage() {
          \x20 frf-fuzz init [--root <path>]\n\
          \x20 frf-fuzz add <name> [--root <path>] [--force]\n\
          \x20 frf-fuzz build <name> [--nightly <tc>] [--sanitizer none|address]\n\
-         \x20 frf-fuzz run <name> [--workers N] [--batch-size N] [--seed <dir>]\n\
-         \x20                 [--max-time <secs>] [--max-execs N] [--sanitizer none|address]\n\
-         \x20                 [--nightly <tc>] [--memory-limit-mb N] [--root <path>] [--rebuild]\n\
+         \x20 frf-fuzz run <name> [--workers N] [--batch-size N] [--seed <dir>]
+         \x20                 [--max-time <secs>] [--max-execs N] [--sanitizer none|address]
+         \x20                 [--nightly <tc>] [--memory-limit-mb N] [--root <path>] [--rebuild]
          \x20                 [--residual on|off] [--precedent on|off]
          \x20                 [--explore-weight N] [--amplify-weight N]
          \x20                 [--discriminate-weight N] [--falsify-weight N]
+         \x20                 [--authority <path>] [--authority-name <n>] [--authority-version <v>]
+         \x20                 [--verify-candidate <path>] [--verify-claim]
+         \x20                 [--question-id <id>] [--fixture-family <fam>]
+         \x20                 [--gemel on|off]
          \x20 frf-fuzz replay <finding-id> [--root <path>] [--target <name>]
-         \x20 frf-fuzz tmin <finding-id> [--root <path>] [--target <name>] [--max-verify N]
+         \x20 frf-fuzz verify <finding-id> --authority <path> [--candidate <path>|--target <name>]
+         \x20                 [--authority-name <n>] [--authority-version <v>] [--claim]
+         \x20                 [--question-id <id>] [--fixture-family <fam>] [--gemel on|off]
+         \x20 frf-fuzz revision replay <tape-id> --state <label>=<binary> [--state ...]
+         \x20                 [--target <name>] [--nightly <tc>] [--sanitizer none|address]
+         \x20 tmin <finding-id> [--root <path>] [--target <name>] [--max-verify N]
          \x20 frf-fuzz cmin <name> [--root <path>]
          \x20 frf-fuzz boundary <finding-id> [--root <path>] [--target <name>] [--max-verify N]
          \x20 frf-fuzz precedent list [--root <path>]
@@ -1299,6 +1310,8 @@ fn cmd_run(args: &[String]) -> Result<i32> {
 
     let initial_dictionary = read_user_dictionary(&root, name)?;
 
+    let authority = frf_authority_from(args)?;
+    let question = court_question_from(args);
     let cfg = crate::execute::coordinator::CampaignConfig {
         target_bin: bin,
         store_root,
@@ -1316,6 +1329,11 @@ fn cmd_run(args: &[String]) -> Result<i32> {
             .split_whitespace()
             .map(|s| s.to_string())
             .collect(),
+        authority,
+        question,
+        verification_candidate: flag_value(args, "--verify-candidate").map(PathBuf::from),
+        verify_claim: has_flag(args, "--verify-claim"),
+        gemel: flag_on_off(args, "--gemel", true)?,
     };
     crate::execute::coordinator::install_sigint_handler();
     eprintln!("[run] target: {}", cfg.target_bin.display());
@@ -1327,6 +1345,24 @@ fn cmd_run(args: &[String]) -> Result<i32> {
         cfg.policy.residual,
         cfg.policy.precedent
     );
+    match cfg.authority.as_ref() {
+        Some(a) => eprintln!(
+            "[run] FRF authority: {}-{} ({}); auto-verify on; candidate: {}",
+            a.name,
+            a.version,
+            a.path.display(),
+            cfg.verification_candidate
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| cfg.target_bin.display().to_string())
+        ),
+        None => eprintln!(
+            "[run] FRF authority: none (findings remain unverified — no fabricated verification)"
+        ),
+    }
+    if cfg.gemel {
+        eprintln!("[run] gemel: on (durable boundaries publish when a repository is present)");
+    }
     let summary = crate::execute::coordinator::run_campaign(&cfg)?;
     println!(
         "\ncampaign {} ({})",
@@ -1362,6 +1398,11 @@ fn cmd_run(args: &[String]) -> Result<i32> {
         summary.probe_contradictions,
         summary.probe_ambiguous
     );
+    println!(
+        "  FRF verifications: {} verified: {} failed: {}",
+        summary.frf_verifications, summary.frf_verified, summary.frf_failed
+    );
+    println!("  gemel boundaries: {}", summary.gemel_boundaries);
     println!("  findings: {}", summary.findings);
     println!("  duration: {:.1}s", summary.duration.as_secs_f64());
     Ok(0)
@@ -1376,6 +1417,56 @@ fn parse_u64(s: &str, what: &str) -> Result<u64> {
         t.parse()
             .map_err(|_| crate::error::Error::Other(format!("{what} must be an integer")))
     }
+}
+
+/// Parse a boolean `on|off|1|0|true|false` flag with a default.
+fn flag_on_off(args: &[String], name: &str, default: bool) -> Result<bool> {
+    let Some(v) = flag_value(args, name) else {
+        return Ok(default);
+    };
+    match v.as_str() {
+        "on" | "1" | "true" => Ok(true),
+        "off" | "0" | "false" => Ok(false),
+        other => Err(crate::error::Error::Other(format!(
+            "{name} must be on|off (got `{other}`)"
+        ))),
+    }
+}
+
+/// Parse the optional FRF authority (`--authority <path>` with
+/// `--authority-name` / `--authority-version`, defaulting to
+/// `reference` / `1.0`). `None` = no authority (findings stay unverified).
+fn frf_authority_from(args: &[String]) -> Result<Option<crate::frf_bridge::AuthoritySpec>> {
+    let Some(path) = flag_value(args, "--authority") else {
+        return Ok(None);
+    };
+    let name = flag_value(args, "--authority-name").unwrap_or_else(|| "reference".to_string());
+    let version = flag_value(args, "--authority-version").unwrap_or_else(|| "1.0".to_string());
+    Ok(Some(crate::frf_bridge::AuthoritySpec {
+        name,
+        version,
+        path: PathBuf::from(path),
+    }))
+}
+
+/// Parse the court-question binding (`--question-id`, `--fixture-family`,
+/// `--question`, `--falsifier`); defaults are the documented standard
+/// crash-differential question.
+fn court_question_from(args: &[String]) -> crate::frf_bridge::CourtQuestion {
+    let mut q = crate::frf_bridge::CourtQuestion::default();
+    if let Some(id) = flag_value(args, "--question-id") {
+        q.id = id;
+    }
+    if let Some(fam) = flag_value(args, "--fixture-family") {
+        q.fixture_family = fam;
+    }
+    if let Some(text) = flag_value(args, "--question") {
+        q.question = text;
+    }
+    if let Some(text) = flag_value(args, "--falsifier") {
+        q.falsifier = text;
+    }
+    q
 }
 
 /// Read the optional user dictionary for a target: `.frf-fuzz/dict/<name>.dict`
@@ -1510,6 +1601,14 @@ fn session_config(
         rustc_release: release,
         llvm_version: llvm,
         instrument_flags: Vec::new(),
+        // Replay/tmin/boundary sessions are single-shot verification
+        // harnesses: no FRF authority, no Gemel boundaries, no court
+        // question (Phase 4 fields defaulted).
+        authority: None,
+        question: Default::default(),
+        verification_candidate: None,
+        verify_claim: false,
+        gemel: false,
     })
 }
 
@@ -1571,6 +1670,376 @@ fn cmd_replay(args: &[String]) -> Result<i32> {
     let new_id = store.put(crate::canon::Family::Finding, &payload)?;
     println!("replay revision: {new_id}");
     Ok(0)
+}
+
+/// Collect every occurrence of a repeatable flag (`--state a=b --state c=d`)
+/// in command-line order.
+fn collect_flag_values(args: &[String], name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        if args[i] == name {
+            if let Some(v) = args.get(i + 1) {
+                out.push(v.clone());
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `frf-fuzz verify <finding-id> --authority <path> [--candidate <path>]
+/// [--authority-name <n>] [--authority-version <v>] [--claim] [--gemel on|off]`
+///
+/// Runs the real FRF court for one promoted finding and persists the
+/// durable verification record. Without `--authority` this command refuses
+/// (an authority is never invented; acceptance item 16). FRF refusal is
+/// preserved as a `Failed` record (I10).
+fn cmd_verify(args: &[String]) -> Result<i32> {
+    let id_hex = args.iter().find(|a| !a.starts_with('-')).ok_or_else(|| {
+        crate::error::Error::Other(
+            "usage: frf-fuzz verify <finding-id> --authority <path> [--candidate <path>]".into(),
+        )
+    })?;
+    // Resolve the authority BEFORE touching the store: without an authority
+    // the command refuses up front (an authority is never invented;
+    // acceptance item 16).
+    let authority = frf_authority_from(args)?.ok_or(crate::error::Error::Refused(
+        "verify requires `--authority <path>`; without an authority a finding stays UNVERIFIED (no fabricated verification)",
+    ))?;
+    let root = project_root(args);
+    let store_root = store_root_of(&root);
+    let store = crate::store::Store::open(store_root.clone())?;
+    let id = crate::id::ContentId::from_hex(id_hex)?;
+    let (family, payload) = store
+        .get_typed(&id)?
+        .ok_or_else(|| crate::error::Error::Other(format!("no object {id}")))?;
+    if family != crate::canon::Family::Finding {
+        return Err(crate::error::Error::Other(format!(
+            "object {id} is {}, not a finding",
+            family.name()
+        )));
+    }
+    let finding = crate::execute::finding::decode_finding(&payload)?;
+
+    // The verification candidate: an instrumented target binary (honors the
+    // `--frf-fuzz-fixture` interface).
+    let candidate = match flag_value(args, "--candidate") {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let name = flag_value(args, "--target").ok_or_else(|| {
+                crate::error::Error::Other(
+                    "verify needs a candidate: `--candidate <path>` or `--target <name>`".into(),
+                )
+            })?;
+            resolve_target_bin(&name, args)?
+        }
+    };
+    let question = court_question_from(args);
+    let with_claim = has_flag(args, "--claim");
+
+    println!(
+        "verifying finding {} ({}B, replay {}) against authority {}-{} ...",
+        id,
+        finding.input.len(),
+        finding.replay.name(),
+        authority.name,
+        authority.version
+    );
+    let (rec_id, rec) = crate::frf_bridge::verify_and_persist(
+        &store,
+        &id,
+        &authority,
+        &question,
+        &candidate,
+        &finding.input,
+        with_claim,
+    )?;
+    match rec.outcome {
+        crate::frf_bridge::VerificationOutcome::Verified => {
+            println!("verification: VERIFIED");
+            println!("  record: {}", rec_id.to_hex());
+            println!(
+                "  authority: {}-{}",
+                rec.authority_name, rec.authority_version
+            );
+            println!("  frf run: {}", rec.run.as_deref().unwrap_or(""));
+            println!("  frf receipt: {}", rec.receipt.as_deref().unwrap_or(""));
+            if let Some(claim) = &rec.claim {
+                println!("  frf claim: {claim}");
+            }
+            if let Some(note) = &rec.note {
+                println!("  note: {note}");
+            }
+            // Durable Gemel boundary (best-effort; standalone when absent).
+            if flag_on_off(args, "--gemel", true)? {
+                let detail = format!(
+                    "frf run {} receipt {}",
+                    rec.run.as_deref().unwrap_or(""),
+                    rec.receipt.as_deref().unwrap_or("")
+                );
+                if let Some(rec_id) = crate::gemel_bridge::publish_boundary(
+                    &store,
+                    &store_root
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| store_root.clone()),
+                    crate::gemel_bridge::BoundaryKind::FindingVerified,
+                    id,
+                    Some(&detail),
+                )? {
+                    println!("  gemel boundary: {}", rec_id.to_hex());
+                }
+            }
+        }
+        crate::frf_bridge::VerificationOutcome::Failed => {
+            println!("verification: FAILED (preserved)");
+            println!("  record: {}", rec_id.to_hex());
+            if let Some(run) = &rec.run {
+                println!("  frf run: {run}");
+            }
+            println!("  note: {}", rec.note.as_deref().unwrap_or(""));
+        }
+    }
+    Ok(0)
+}
+
+/// `frf-fuzz revision replay <tape-id> --state <label>=<binary> [--state ...]`
+///
+/// Revision tape replay (Phase 4): re-executes one tape's exact candidate
+/// through each state artifact (an instrumented frf-fuzz target binary built
+/// from that revision) and persists the adjacent-pair revision residuals
+/// (Family::RevisionResidual). The state order is the caller's (usually
+/// chronological). Labels are free-form (Gemel state Gids, commit ids, ...).
+fn cmd_revision(args: &[String]) -> Result<i32> {
+    let sub = args.iter().find(|a| !a.starts_with('-')).ok_or_else(|| {
+        crate::error::Error::Other("usage: frf-fuzz revision replay <tape-or-finding-id>".into())
+    })?;
+    if sub != "replay" {
+        return Err(crate::error::Error::Other(format!(
+            "unknown revision subcommand `{sub}` (only `replay` is implemented)"
+        )));
+    }
+    let tape_hex = args
+        .iter()
+        .skip_while(|a| *a == "replay" || a.starts_with('-'))
+        .find(|a| !a.starts_with('-'))
+        .ok_or_else(|| {
+            crate::error::Error::Other(
+                "usage: frf-fuzz revision replay <tape-or-finding-id>".into(),
+            )
+        })?;
+    let root = project_root(args);
+    let store_root = store_root_of(&root);
+    let store = crate::store::Store::open(store_root.clone())?;
+    // The subject is a run-tape id, or a finding id whose campaign crash
+    // tape is resolved (its exact input is the replay candidate).
+    let (tape_id, tape) = resolve_revision_tape(&store, tape_hex)?;
+
+    // Parse the state probes: repeatable `--state <label>=<binary>`.
+    let specs = collect_flag_values(args, "--state");
+    if specs.len() < 2 {
+        return Err(crate::error::Error::Other(
+            "revision replay needs at least two `--state <label>=<binary>` probes".into(),
+        ));
+    }
+    let mut states: Vec<(String, PathBuf)> = Vec::new();
+    for spec in &specs {
+        let (label, path) = spec.split_once('=').ok_or_else(|| {
+            crate::error::Error::Other(format!("--state must be <label>=<binary> (got `{spec}`)"))
+        })?;
+        let label = label.trim();
+        if label.is_empty() || label.len() > crate::tape::revision::MAX_REVISION_LABEL_LEN {
+            return Err(crate::error::Error::Other(
+                "--state label must be non-empty and bounded".into(),
+            ));
+        }
+        states.push((label.to_string(), PathBuf::from(path)));
+    }
+
+    // Resolve the session parameters (nightly/sanitizer; the artifact env
+    // digest is computed from the *session* toolchain identity).
+    let name = flag_value(args, "--target").ok_or_else(|| {
+        crate::error::Error::Other(
+            "revision replay needs `--target <name>` for the session configuration".into(),
+        )
+    })?;
+    let base_cfg = session_config(&name, args)?;
+    let env_digest = crate::tape::model::environment_digest(
+        &base_cfg.target_name,
+        &base_cfg.rustc_release,
+        &base_cfg.llvm_version,
+        base_cfg.sanitizer.wire_mode(),
+    );
+
+    // Build one probe per state. Each probe owns its own Session (a worker
+    // per artifact, respawned on death).
+    let mut obs = Vec::new();
+    for (label, binary) in &states {
+        // The artifact digest: BLAKE3-256 of the exact binary bytes that
+        // will execute (content, not path).
+        let bytes = std::fs::read(binary).map_err(|e| {
+            crate::error::Error::Other(format!(
+                "cannot read state binary {}: {e}",
+                binary.display()
+            ))
+        })?;
+        let artifact: [u8; 32] = *crate::id::ContentId::new(&bytes).as_bytes();
+        let mut cfg = base_cfg.clone();
+        cfg.target_bin = binary.clone();
+        let mut session = Session::new(cfg);
+        {
+            let mut state_obs: Option<crate::tape::revision::RevisionStateObservation> = None;
+            {
+                let mut verify = |input: &[u8]| -> Result<(
+                    bool,
+                    crate::target_runtime::signals::SignalVector,
+                    Vec<u64>,
+                )> {
+                    let r = session.verify(input)?;
+                    let survived = !r.0;
+                    let termination = if survived {
+                        crate::tape::model::TerminationStatus::Ok
+                    } else {
+                        match tape.termination {
+                            crate::tape::model::TerminationStatus::Ok => {
+                                crate::tape::model::TerminationStatus::Crash
+                            }
+                            other => other,
+                        }
+                    };
+                    state_obs = Some(crate::tape::revision::RevisionStateObservation {
+                        label: label.clone(),
+                        artifact,
+                        environment: env_digest,
+                        termination,
+                        signals: if survived { Some(r.1.clone()) } else { None },
+                    });
+                    let _ = r.2;
+                    Ok(r)
+                };
+                let outcome = crate::tape::replay::replay_tape_payload(&tape, &mut verify)?;
+                println!(
+                    "[state {}] vs tape: {}",
+                    label,
+                    match &outcome {
+                        crate::tape::replay::TapeReplayOutcome::Matches => "matches".to_string(),
+                        crate::tape::replay::TapeReplayOutcome::TerminationReproduced => {
+                            "termination reproduced".to_string()
+                        }
+                        crate::tape::replay::TapeReplayOutcome::Diverged { reason } => {
+                            format!("diverged: {reason}")
+                        }
+                    }
+                );
+            }
+            obs.push(state_obs.expect("probe ran"));
+        }
+    }
+
+    // Persist the adjacent-pair revision residuals.
+    let ids = crate::tape::revision::persist_pairs(&store, &tape_id, &obs)?;
+    println!("revision pairs: {}", ids.len());
+    for (pair, pair_id) in ids.iter().enumerate() {
+        println!("  pair {}: {}", pair + 1, pair_id.to_hex());
+    }
+    // Print the derived residuals (delta summary per moved axis).
+    for w in obs.windows(2) {
+        let r = crate::tape::revision::RevisionPair {
+            tape: tape_id,
+            earlier: w[0].clone(),
+            later: w[1].clone(),
+        };
+        match r.residual() {
+            Some(res) => {
+                println!(
+                    "residual {} -> {}: moved axes {:#x}",
+                    w[0].label,
+                    w[1].label,
+                    res.moved()
+                );
+                for i in 0..crate::target_runtime::signals::MAX_SIGNALS {
+                    if res.delta(i) != 0 {
+                        println!("  signal {i}: delta {}", res.delta(i));
+                    }
+                }
+            }
+            None => {
+                let t0 = w[0].termination;
+                let t1 = w[1].termination;
+                if t0 == t1 {
+                    println!(
+                        "residual {} -> {}: none (both {})",
+                        w[0].label,
+                        w[1].label,
+                        t0.name()
+                    );
+                } else {
+                    println!(
+                        "residual {} -> {}: termination change ({} -> {})",
+                        w[0].label,
+                        w[1].label,
+                        t0.name(),
+                        t1.name()
+                    );
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// Resolve the revision-replay subject: a run-tape id directly, or a finding
+/// id whose crash tape is located deterministically (the stored tape whose
+/// candidate equals the finding's exact input; lowest object id on ties).
+fn resolve_revision_tape(
+    store: &crate::store::Store,
+    hex_id: &str,
+) -> Result<(crate::id::ContentId, crate::tape::model::RunTape)> {
+    let id = crate::id::ContentId::from_hex(hex_id)?;
+    let (family, payload) = store
+        .get_typed(&id)?
+        .ok_or_else(|| crate::error::Error::Other(format!("no object {id}")))?;
+    match family {
+        crate::canon::Family::RunTape => {
+            let tape = crate::tape::model::decode_tape(&payload)?;
+            Ok((id, tape))
+        }
+        crate::canon::Family::Finding => {
+            let finding = crate::execute::finding::decode_finding(&payload)?;
+            // Scan for the stored tape whose candidate equals the finding's
+            // exact input (crash tapes are written at findings; the lowest
+            // object id resolves deterministically when several identical
+            // inputs were recorded).
+            let mut best: Option<(crate::id::ContentId, crate::tape::model::RunTape)> = None;
+            for tid in store.list_object_ids()? {
+                let Ok(Some((crate::canon::Family::RunTape, tpayload))) = store.get_typed(&tid)
+                else {
+                    continue;
+                };
+                let Ok(tape) = crate::tape::model::decode_tape(&tpayload) else {
+                    continue;
+                };
+                if tape.candidate == finding.input {
+                    let replace = best.as_ref().map(|(bid, _)| tid < *bid).unwrap_or(true);
+                    if replace {
+                        best = Some((tid, tape));
+                    }
+                }
+            }
+            best.ok_or_else(|| {
+                crate::error::Error::Other(format!(
+                    "no run tape stores the input of finding {id} (finding-driven revision replay needs the campaign's crash tape)"
+                ))
+            })
+        }
+        other => Err(crate::error::Error::Other(format!(
+            "object {id} is {}, not a run-tape or finding",
+            other.name()
+        ))),
+    }
 }
 
 /// `frf-fuzz tmin <finding-id>`
@@ -2109,6 +2578,99 @@ fn cmd_inspect(args: &[String]) -> Result<i32> {
                 print!("{}", crate::precedent::render_precedent(&p, Some(&id)));
             }
         }
+        crate::canon::Family::FindingVerification => {
+            if let Ok(v) = crate::frf_bridge::decode_verification(payload) {
+                println!("finding: {}", v.finding);
+                println!("authority: {}-{}", v.authority_name, v.authority_version);
+                println!("outcome: {}", v.outcome.name());
+                if let Some(run) = &v.run {
+                    println!("frf run: {run}");
+                }
+                if let Some(receipt) = &v.receipt {
+                    println!("frf receipt: {receipt}");
+                }
+                if let Some(claim) = &v.claim {
+                    println!("frf claim: {claim}");
+                }
+                if let Some(note) = &v.note {
+                    println!("note: {note}");
+                }
+            }
+        }
+        crate::canon::Family::GemelBoundary => {
+            if let Ok(b) = crate::gemel_bridge::decode_boundary(payload) {
+                println!("kind: {}", b.kind.name());
+                println!("subject: {}", b.subject);
+                println!("publish: {} failure: {}", b.state.name(), b.failure.name());
+                if let Some(hs) = &b.head_state {
+                    println!("head state: {hs}");
+                }
+                if let Some(hc) = &b.head_change {
+                    println!("head change: {hc}");
+                }
+                if let Some(it) = &b.intent {
+                    println!("intent: {it}");
+                }
+                if let Some(tr) = &b.trajectory {
+                    println!("trajectory: {tr}");
+                }
+                if let Some(pr) = &b.producer {
+                    println!("producer: {pr}");
+                }
+                if let Some(cp) = &b.checkpoint {
+                    println!("checkpoint: {cp}");
+                }
+                if let Some(ev) = &b.evidence {
+                    println!("evidence: {ev}");
+                }
+                if let Some(cl) = &b.claim {
+                    println!("claim: {cl}");
+                }
+                if let Some(rs) = &b.residual {
+                    println!("residual: {rs}");
+                }
+            }
+        }
+        crate::canon::Family::RevisionResidual => {
+            if let Ok(p) = crate::tape::revision::decode_revision_pair(payload) {
+                println!("tape: {}", p.tape);
+                println!(
+                    "earlier: label={} artifact={} env={} termination={}",
+                    p.earlier.label,
+                    hex_dump(&p.earlier.artifact),
+                    hex_dump(&p.earlier.environment),
+                    p.earlier.termination.name()
+                );
+                println!(
+                    "later: label={} artifact={} env={} termination={}",
+                    p.later.label,
+                    hex_dump(&p.later.artifact),
+                    hex_dump(&p.later.environment),
+                    p.later.termination.name()
+                );
+                match p.residual() {
+                    Some(r) => {
+                        println!("moved axes: {:#x}", r.moved());
+                        for i in 0..crate::target_runtime::signals::MAX_SIGNALS {
+                            if r.delta(i) != 0 {
+                                println!("  signal {i}: delta {}", r.delta(i));
+                            }
+                        }
+                    }
+                    None => {
+                        if p.earlier.termination == p.later.termination {
+                            println!("residual: none (both {})", p.earlier.termination.name());
+                        } else {
+                            println!(
+                                "residual: none (termination change {} -> {})",
+                                p.earlier.termination.name(),
+                                p.later.termination.name()
+                            );
+                        }
+                    }
+                }
+            }
+        }
         _ => {
             println!(
                 "payload head: {}",
@@ -2176,6 +2738,35 @@ fn cmd_fsck(args: &[String]) -> Result<i32> {
         failed = true;
         println!("precedent link errors: {}", precedent_errors.len());
         for e in &precedent_errors {
+            println!("  ERROR: {e}");
+        }
+    }
+    // Phase 4 link closure: verification records, gemel boundaries, and
+    // revision residuals must resolve to the objects they name.
+    let verification_errors = crate::frf_bridge::verify_links(&store)?;
+    if !verification_errors.is_empty() {
+        failed = true;
+        println!(
+            "finding-verification link errors: {}",
+            verification_errors.len()
+        );
+        for e in &verification_errors {
+            println!("  ERROR: {e}");
+        }
+    }
+    let gemel_errors = crate::gemel_bridge::verify_links(&store)?;
+    if !gemel_errors.is_empty() {
+        failed = true;
+        println!("gemel-boundary link errors: {}", gemel_errors.len());
+        for e in &gemel_errors {
+            println!("  ERROR: {e}");
+        }
+    }
+    let revision_errors = crate::tape::revision::verify_links(&store)?;
+    if !revision_errors.is_empty() {
+        failed = true;
+        println!("revision-residual link errors: {}", revision_errors.len());
+        for e in &revision_errors {
             println!("  ERROR: {e}");
         }
     }

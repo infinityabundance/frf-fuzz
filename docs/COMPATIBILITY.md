@@ -237,3 +237,35 @@ Phase 0 was verified on x86_64-linux. The scalar SIMD path is portable; AVX2
 is x86_64-only and runtime-gated. The raw pointer-based ring reads rely on
 the single-threaded worker discipline (portable), not on x86 atomicity
 (documented in `target_runtime/cmp.rs`).
+
+## 9. Phase-4 integration notes (FRF + Gemel)
+
+* FRF courts execute the candidate (and the authority) as real subprocesses
+  with hard harness bounds (60 s / 16 MiB per side) under an EMPTY declared
+  environment. The verification candidate must therefore be self-contained:
+  an instrumented frf-fuzz target binary is, via its `--frf-fuzz-fixture`
+  single-shot mode (`target_runtime/fixture.rs`), which requires no
+  environment.
+* FRF hashes the full candidate binary per court; at promotion (Level 2) a
+  court costs on the order of seconds on this machine. This is deliberate:
+  crashes are rare, and the per-execution loop never touches FRF. A
+  campaign whose crash rate is high pays per distinct crashing input (the
+  coordinator dedups identical inputs per campaign).
+* FRF executes sides through sealed memfd images; a dynamically-linked Rust
+  binary works when its interpreter/loader closure resolves (verified
+  end-to-end on x86_64-linux by `scripts/golden_demo.sh` stages 11-17). A
+  side that the profile cannot execute produces a REFUSED run, which
+  frf-fuzz records as a `Failed` verification — never a fabricated capture.
+* ASan-instrumented binaries are not suitable FRF sides (the ASan runtime
+  under the sealed/sandboxed profile is not a supported surface); ASan
+  campaigns that auto-verify should pass `--verify-candidate` pointing at a
+  non-ASan build of the same target.
+* Gemel publications require a writable `.gemel` repository discoverable
+  from the project root. `workflow::create_checkpoint` takes the repo write
+  lock; boundaries are rare (campaign start/end, verified findings,
+  precedents), so contention is not a loop concern. rusqlite's bundled
+  SQLite needs a C compiler (the `doctor` check covers `cc`).
+* FRF run/receipt ids are NOT portable across different frf-fuzz binaries:
+  FRF's runner identity is the hash of the embedding executable, so the
+  same court observed by two different coordinator builds yields two valid
+  evidence chains. Idempotent convergence holds within one binary (tested).

@@ -58,5 +58,22 @@ grep -q 'corpus entries:' report.out
 $FF fsck | tee fsck.out
 grep -q 'fsck: ok' fsck.out
 
+# Phase-4 CLI surface: the authority-less store reports zero FRF
+# verifications (derived unverified), and the new commands refuse cleanly
+# without their required arguments.
+echo "=== 6. phase-4 CLI surface ==="
+grep -q 'FRF verifications: 0' report.out || { echo "FAIL: authority-less store fabricated verifications"; exit 1; }
+grep -q 'gemel boundaries: 0' report.out || { echo "FAIL: gemel boundaries reported without a repo"; exit 1; }
+if $FF verify 0000000000000000000000000000000000000000000000000000000000000000 > verify-noauth.out 2>&1; then
+  echo "FAIL: verify without --authority succeeded"
+  exit 1
+fi
+grep -q 'requires .--authority.' verify-noauth.out || { echo "FAIL: verify error not actionable"; exit 1; }
+if $FF revision replay 0000000000000000000000000000000000000000000000000000000000000000 > revision-noargs.out 2>&1; then
+  echo "FAIL: revision replay without states succeeded"
+  exit 1
+fi
+grep -q 'no object' revision-noargs.out || { echo "FAIL: revision replay error not actionable"; exit 1; }
+
 echo
 echo "CLI SMOKE PASS"

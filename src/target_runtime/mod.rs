@@ -27,6 +27,7 @@
 //! [`sancov::footprint_calibrate`] and docs/COMPATIBILITY.md.
 
 pub mod cmp;
+pub mod fixture;
 pub mod sancov;
 pub mod signals;
 pub mod target;

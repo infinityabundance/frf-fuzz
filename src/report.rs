@@ -67,6 +67,16 @@ pub struct Report {
     pub precedent_revisions: u64,
     /// Signal schema objects.
     pub signal_schemas: u64,
+    /// FRF verification records (Phase 4).
+    pub frf_verifications: u64,
+    /// FRF-verified findings (receipts emitted; Phase 4).
+    pub frf_verified: u64,
+    /// FRF verification attempts that failed (preserved; Phase 4).
+    pub frf_failed: u64,
+    /// Gemel boundary records (Phase 4).
+    pub gemel_boundaries: u64,
+    /// Revision-residual pair objects (Phase 4).
+    pub revision_residuals: u64,
     /// Refs (name -> id hex), sorted.
     pub refs: Vec<(String, String)>,
     /// Per-family object counts.
@@ -125,6 +135,19 @@ pub fn generate(store_root: &std::path::Path) -> Result<Report> {
             Family::StructuralEpisode => report.structural_episodes += 1,
             Family::Precedent => report.precedent_revisions += 1,
             Family::SignalSchema => report.signal_schemas += 1,
+            Family::FindingVerification => {
+                report.frf_verifications += 1;
+                if let Ok(rec) = crate::frf_bridge::decode_verification(&payload) {
+                    match rec.outcome {
+                        crate::frf_bridge::VerificationOutcome::Verified => {
+                            report.frf_verified += 1
+                        }
+                        crate::frf_bridge::VerificationOutcome::Failed => report.frf_failed += 1,
+                    }
+                }
+            }
+            Family::GemelBoundary => report.gemel_boundaries += 1,
+            Family::RevisionResidual => report.revision_residuals += 1,
             _ => {}
         }
     }
@@ -180,6 +203,12 @@ pub fn render_human(r: &Report) -> String {
         r.precedents, r.precedent_revisions
     ));
     s.push_str(&format!("signal schemas: {}\n", r.signal_schemas));
+    s.push_str(&format!(
+        "FRF verifications: {} (verified: {}, failed: {})\n",
+        r.frf_verifications, r.frf_verified, r.frf_failed
+    ));
+    s.push_str(&format!("gemel boundaries: {}\n", r.gemel_boundaries));
+    s.push_str(&format!("revision residuals: {}\n", r.revision_residuals));
     s.push_str(&format!("findings: {}\n", r.findings.len()));
     for f in &r.findings {
         s.push_str(&format!(
@@ -215,8 +244,8 @@ pub fn render_json(r: &Report) -> String {
             .unwrap_or_else(|| "null".to_string())
     ));
     s.push_str(&format!(
-        "\"corpus_entries\":{},\"corpus_features\":{},\"state_features\":{},\"tapes\":{},\"morphologies\":{},\"boundaries\":{},\"regime_episodes\":{},\"structural_verdicts\":{},\"structural_episodes\":{},\"precedent_families\":{},\"precedent_revisions\":{},\"signal_schemas\":{},\"findings\":[",
-        r.corpus_entries, r.corpus_features, r.state_features, r.tapes, r.morphologies, r.boundaries, r.regime_episodes, r.structural_verdicts, r.structural_episodes, r.precedents, r.precedent_revisions, r.signal_schemas
+        "\"corpus_entries\":{},\"corpus_features\":{},\"state_features\":{},\"tapes\":{},\"morphologies\":{},\"boundaries\":{},\"regime_episodes\":{},\"structural_verdicts\":{},\"structural_episodes\":{},\"precedent_families\":{},\"precedent_revisions\":{},\"signal_schemas\":{},\"frf_verifications\":{},\"frf_verified\":{},\"frf_failed\":{},\"gemel_boundaries\":{},\"revision_residuals\":{},\"findings\":[",
+        r.corpus_entries, r.corpus_features, r.state_features, r.tapes, r.morphologies, r.boundaries, r.regime_episodes, r.structural_verdicts, r.structural_episodes, r.precedents, r.precedent_revisions, r.signal_schemas, r.frf_verifications, r.frf_verified, r.frf_failed, r.gemel_boundaries, r.revision_residuals
     ));
     for (i, f) in r.findings.iter().enumerate() {
         if i > 0 {

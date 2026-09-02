@@ -45,18 +45,40 @@ dispositions, and trajectory semantics are the `frf` crate's job. We retain
 its IDs verbatim and never reinterpret them.
 
 * Code: no FRF reimplementation anywhere; `docs/DESIGN-FRF-BRIDGE.md`
-  records the verified call sequence to invoke the real library (Phase 4).
+  records the verified call sequence to invoke the real library (implemented
+  in Phase 4).
 * Enforcement: the frf crate is the only code that constructs FRF IDs.
+* Phase 4: a crash finding is `Verified` only when the court observed at
+  least one residual divergence; a parity receipt (zero residuals) classifies
+  the finding `Failed` with the receipt preserved as evidence of
+  non-reproduction. The divergence decision reads FRF's own capture records —
+  it never re-derives FRF's comparison semantics.
+
+## I4b. Without a configured authority, verification is DERIVED, never fabricated
+
+A finding with no verification record is `Unverified` by derivation — there is
+no "unverified" object to write. `frf-fuzz verify` and campaign auto-verify
+refuse when no `--authority` is given (an authority is never invented).
+
+* Code: `frf_bridge::current_verification` returns `None` for unverified
+  findings; `cli::cmd_verify` refuses without `--authority`.
+* Tests: `tests/phase4_frf_gemel.rs::no_authority_means_derived_unverified`;
+  the golden demo asserts the authority-less stores report zero verifications.
 
 ## I5. Gemel is never mutated for ordinary per-execution telemetry
 
-Gemel receives durable boundaries only (campaign creation/checkpoint,
-promoted precedent, FRF-verified finding, falsified precedent, resolved
-finding, completion). Reads during the fuzz loop only.
+Gemel receives durable boundaries only (campaign creation/completion
+checkpoints, FRF-verified finding evidence+claim, promoted precedent
+evidence, falsified precedent residual). Reads during the fuzz loop only;
+no Gemel write happens per execution.
 
-* Code: `docs/DESIGN-GEMEL-BRIDGE.md` (verified read/write API split).
-* Test: standalone operation without a `.gemel` repo (the entire Phase-0
-  test suite runs without one).
+* Code: `docs/DESIGN-GEMEL-BRIDGE.md` (verified read/write API split);
+  `gemel_bridge.rs` (implemented in Phase 4) performs reads inside the loop
+  and publications only at `publish_boundary` call sites (campaign
+  start/end, verified finding, precedent admission/falsification).
+* Test: standalone operation without a `.gemel` repo (the entire test suite
+  runs without one); `gemel_absent_is_standalone` asserts no writes; the
+  golden demo asserts no per-execution Gemel objects (boundary counts only).
 
 ## I6. Unknown DSFB structure is never silently renamed to the closest motif
 
@@ -100,12 +122,18 @@ links). Admittance without provenance is a bug.
 ## I10. Contradictory/falsifying evidence is never deleted
 
 A contradicted precedent is retained with its counterexample. History is
-monotone: a later pass never erases an earlier unresolved residual.
+monotone: a later pass never erases an earlier unresolved residual. Phase 4
+additions: an FRF `Failed` verification (including a parity receipt) is a
+permanent record; a Gemel publication failure is recorded with its failure
+class; a falsified precedent publishes a Gemel `Residual` (negative
+knowledge) that is never deleted.
 
-* Code: `precedent/` (Phase 3); the store's immutability model
-  (`canon.rs` framing + content-addressed writes) makes deletion impossible
-  by construction.
-* Tests (Phase 3): `contradictory evidence never deleted`.
+* Code: `precedent/` (Phase 3); `frf_bridge.rs` / `gemel_bridge.rs`
+  (Phase 4); the store's immutability model (`canon.rs` framing +
+  content-addressed writes) makes deletion impossible by construction.
+* Tests (Phase 3): `contradictory evidence never deleted`; (Phase 4):
+  `non_reproducing_finding_is_failed_and_preserved`,
+  `falsified_precedent_publishes_negative_knowledge`.
 
 ## I11. No prediction is represented as probability
 
@@ -139,7 +167,10 @@ collision with different bytes is never resolved silently.
 
 All optional integrations are additive. A crash or refusal in the FRF court,
 a missing Gemel repo, or an unavailable GPU leaves the standalone campaign
-fully functional.
+fully functional. Phase 4: campaign verification is best-effort — an FRF
+refusal or hard config error is persisted as a `Failed` record, never
+fatal to the campaign; a Gemel-side failure writes a local `GemelBoundary`
+record with a deterministic failure class and the campaign continues.
 
 * Code: feature gating (`coordinator`/`database`/`cuda`/`rocm`); standalone
   paths return `Unverified`/`Absent` rather than failing.

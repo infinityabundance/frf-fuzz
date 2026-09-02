@@ -131,6 +131,13 @@ pub fn run(hooks: TargetHooks) -> ! {
         eprintln!("frf-fuzz worker: fuzz_target! registered twice (two macros in one binary)");
         std::process::exit(2)
     });
+    // Single-shot fixture mode (Phase 4): `--frf-fuzz-fixture <path>` runs
+    // the registered hooks exactly once over the file's bytes and exits —
+    // the case-harness interface FRF courts and revision harnesses execute.
+    // It requires no environment and never returns to the worker loop.
+    if super::fixture::is_fixture_invocation() {
+        super::fixture::run_fixture_and_exit();
+    }
     let code = super::worker::run_main();
     std::process::exit(code);
 }

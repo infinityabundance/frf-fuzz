@@ -74,6 +74,12 @@ pub mod id;
 pub mod observe;
 
 #[cfg(feature = "coordinator")]
+pub mod frf_bridge;
+
+#[cfg(feature = "coordinator")]
+pub mod gemel_bridge;
+
+#[cfg(feature = "coordinator")]
 pub mod dsfb;
 
 #[cfg(feature = "coordinator")]

@@ -88,11 +88,31 @@ pub enum Family {
     /// A closed DSFB-flavored structural episode (Phase 3): the lineage
     /// segment during which at least one axis sustained policy ≥ Review.
     StructuralEpisode = 0x0E,
+    /// An FRF court-verification record (Phase 4): one promoted finding
+    /// bound to one FRF evidence chain (run/receipt/claim ids, retained
+    /// verbatim). Absence of a record for a finding = Unverified (derived,
+    /// never fabricated). The record's identity is a pure function of its
+    /// own content, so re-verification converges on one object.
+    FindingVerification = 0x0F,
+    /// A durable Gemel boundary record (Phase 4): one frf-fuzz durable
+    /// boundary (campaign created/completed, finding verified, precedent
+    /// admitted or falsified) with the Gemel source-state binding captured
+    /// at that moment (head-state/change/intent/trajectory/producer Gids,
+    /// retained verbatim) plus the outcome Gids Gemel published. Records
+    /// the publication result class so a Gemel-side failure is observable
+    /// and never silent (I14). No Gemel ID is ever reinterpreted.
+    GemelBoundary = 0x10,
+    /// A revision residual R_V(Vn, Vn-1, tape) (Phase 4): the typed
+    /// behavioral difference between two artifact observations of the SAME
+    /// tape candidate. Computed by revision tape replay; the scalar
+    /// semantics are the MutationResidual semantics applied across the
+    /// revision axis (never flattened).
+    RevisionResidual = 0x11,
 }
 
 impl Family {
     /// All defined families.
-    pub const ALL: [Family; 14] = [
+    pub const ALL: [Family; 17] = [
         Family::CorpusEntry,
         Family::Finding,
         Family::RunTape,
@@ -107,6 +127,9 @@ impl Family {
         Family::SignalSchema,
         Family::StructuralVerdict,
         Family::StructuralEpisode,
+        Family::FindingVerification,
+        Family::GemelBoundary,
+        Family::RevisionResidual,
     ];
 
     /// The one-byte family code.
@@ -136,6 +159,9 @@ impl Family {
             Family::SignalSchema => "signal-schema",
             Family::StructuralVerdict => "structural-verdict",
             Family::StructuralEpisode => "structural-episode",
+            Family::FindingVerification => "finding-verification",
+            Family::GemelBoundary => "gemel-boundary",
+            Family::RevisionResidual => "revision-residual",
         }
     }
 }

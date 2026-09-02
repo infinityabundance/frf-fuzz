@@ -395,25 +395,75 @@ priorities only; all ties break deterministically (entry ID order).
   observe -> retain -> subdivide). Explicitly NOT sound taint analysis; false
   positives/negatives documented.
 
-## 15. FRF bridge (Phase 4)
+## 15. FRF bridge (Phase 4, implemented in 0.4.0)
 
 frf-fuzz findings are hypotheses, never FRF claims/receipts. On promotion
 with a configured authority: build the exact FRF court question (authority,
-candidate, fixture, observable axes), invoke the `frf` library, retain the
-real receipt ID verbatim. FRF refusal is preserved. No configured authority
-=> `FindingVerification::Unverified`; never invent an authority. The verified
-call sequence is in `DESIGN-FRF-BRIDGE.md`. Invariant I4: FRF claim/evidence
-semantics are never recreated here.
+candidate, fixture, observable axes), invoke the `frf` library in-process,
+retain the real run/receipt/claim IDs verbatim (opaque, FRF's namespace).
 
-## 16. Gemel bridge (Phase 4)
+Implementation (`src/frf_bridge.rs`):
+
+- `Family::FindingVerification` (0x0F) objects are durable verification
+  records: finding id + authority name/version + outcome + FRF run/receipt/
+  claim ids + a deterministic bounded note. Absence of a record = derived
+  `Unverified` (never fabricated).
+- The court is run through `frf::commands::court::run_once` with
+  `reuse = true`, so identical evidence is captured once and reused (FRF
+  immutability); the working directory is pinned to the FRF store root for
+  the duration so the capture's environment identity (which records cwd) is
+  stable. The manifest is emitted by a strict YAML writer (no serde in
+  frf-fuzz) validated in tests against FRF's own parser.
+- **A crash finding is `Verified` only when the court observed at least one
+  residual divergence** (candidate differed from the reference over the
+  declared observables). FRF also emits receipts for parity runs (zero
+  residuals); those classify the finding as `Failed` — the crash did not
+  reproduce as a differential — and the parity receipt is PRESERVED as
+  evidence of that non-reproduction (I10).
+- FRF refusal (court refused, receipt refused, claim blocked) is a `Failed`
+  record with the reason; never deleted or downgraded. Claim compilation is
+  an explicit opt-in (`--claim` / `--verify-claim`): residuals are disposed
+  `Intentional` (a non-blocking closure) and a baseline claim is compiled.
+- The FRF store lives at `<store-root>/frf-root/` and is the source of
+  truth for FRF IDs (level-2 durable boundary writes only).
+- In campaigns, `run --authority <path>` auto-verifies each replay-confirmed
+  crash finding at promotion (Level 2) with a per-campaign input dedup so a
+  crash flood never re-runs the same court per duplicate input. The
+  verification candidate is the fuzz-target binary itself (its single-shot
+  `--frf-fuzz-fixture` fixture mode, see `target_runtime::fixture`); ASan
+  campaigns should point `--verify-candidate` at a non-ASan build.
+- `frf-fuzz verify <finding-id>` verifies an existing finding standalone
+  (idempotent: same binary + authority + question converge on one record).
+
+## 16. Gemel bridge (Phase 4, implemented in 0.4.0)
 
 Gemel is longitudinal memory. No `.gemel` repo => standalone mode (verified:
-`Repo::find` -> `NotARepository`). With a repo: read-only during the fuzz
-loop (state Gid via `refs/state/head`, pending intent, current trajectory);
-durable boundaries only — campaign creation/checkpoint, promoted precedent,
-FRF-verified finding, falsified precedent, resolved finding, campaign
-completion. Never per-execution writes (I5). The verified call sequence is in
-`DESIGN-GEMEL-BRIDGE.md`.
+`Repo::find` -> `NotARepository`); with a repo, the fuzz loop is read-only
+w.r.t. Gemel (I5) and durable boundaries publish at Level 3.
+
+Implementation (`src/gemel_bridge.rs`):
+
+- `Family::GemelBoundary` (0x10) objects record every durable boundary: kind
+  (campaign created/completed, finding verified, precedent admitted,
+  falsified precedent), the frf-fuzz subject id, the Gemel source-state
+  snapshot (head-state/change/intent/trajectory/producer Gids, verbatim),
+  the published outcome Gids, and a deterministic failure class when the
+  Gemel-side publication failed — failures are observable and never fatal
+  (I14).
+- Campaign creation/completion publish Gemel checkpoints
+  (`workflow::create_checkpoint`). An FRF-verified finding publishes an
+  `Evidence` (kind `court_receipt`) bound to the current state Gid (field
+  0x11) plus a `Claim`; a promoted precedent publishes an `Evidence` (kind
+  `fuzz_result`); a falsified precedent publishes a `Residual`
+  (classification `expected_mismatch`) — negative knowledge, never deleted
+  (I10). No head state => the record says `no-head-state`; no fabricated
+  binding.
+- `frf-fuzz revision replay <tape-or-finding-id> --state <label>=<binary>`
+  replays one tape's exact candidate through per-state artifacts and
+  persists `Family::RevisionResidual` (0x11) pairs: the tape id, both
+  artifact digests (BLAKE3 of the exact binaries), both environment
+  digests, both termination statuses, and both signal observations; the
+  typed residual R_V is derived at decode time ([`RevisionResidual::of`]).
 
 ## 17. GPU (Phase 7)
 
@@ -429,25 +479,29 @@ See `src/lib.rs` for the current tree. Ungated modules (shared with the
 instrumented target): `error`, `canon`, `mutation/{mod,prng,coordinate,
 bytes,integer,splice,dictionary,cmp,influence}`, `simd/{mod,scalar,
 x86_avx2}`, `scheduler/work_order`, `execute/{protocol,crash_ledger}`,
-`target_runtime/{sancov,cmp,signals,target,worker}`. Coordinator-gated:
-`id`, `store/{object,refs,fsck}`, `corpus/{entry,admission,minimize}`,
-`observe/{frame,residual,signals,sketch}`,
+`target_runtime/{sancov,cmp,signals,target,worker,fixture}`.
+Coordinator-gated: `id`, `store/{object,refs,fsck}`, `corpus/{entry,
+admission,minimize}`, `observe/{frame,residual,signals,sketch}`,
 `dsfb/{regime,morphology,debug_bridge,fuzz_bank}`,
-`precedent/{mod,model,matching,probe,admission}`,
-`scheduler/policy`, `execute/{finding,worker_process,coordinator}`,
-`boundary/{witness,minimize}`, `tape/{model,replay}`, `report`, `cli`,
-`bin/{frf-fuzz,cargo-frf-fuzz}`. Later phases add `gpu/`,
-`frf_bridge.rs`, `gemel_bridge.rs`, and `dsfb/database_bridge`.
+`precedent/{mod,model,matching,probe,admission}`, `scheduler/policy`,
+`execute/{finding,worker_process,coordinator}`, `boundary/{witness,
+minimize}`, `tape/{model,replay,revision}`, `frf_bridge`, `gemel_bridge`,
+`report`, `cli`, `bin/{frf-fuzz,cargo-frf-fuzz}`. Later phases add `gpu/`
+and `dsfb/database_bridge`.
 
 `bin/frf-fuzz.rs` and `bin/cargo-frf-fuzz.rs` are thin argv adapters to
 `frf_fuzz::cli` — no duplicated command logic.
 
 `execute/coordinator.rs` keeps one per-root DSFB substrate per campaign
 (`CampaignState::root_dsfb`) plus the verdict/episode and probe counters.
-The CLI now has `precedent list|show` and the `--precedent` + per-class
-weight switches; `report` counts the Phase-3 families (structural verdicts,
-structural episodes, precedent families + revisions); `fsck` validates
-precedent revision chains, lineage roots, and terminal references.
+Phase 4 families: `canon::Family::{FindingVerification=0x0F,
+GemelBoundary=0x10, RevisionResidual=0x11}`; `report` counts them, `fsck`
+validates their links (verification records -> findings with FRF-id shape
+checks; gemel boundaries -> their subjects + published-Gid presence;
+revision pairs -> their tapes), and `inspect` decodes all three. The CLI has
+`verify` and `revision replay`; `run` takes `--authority*`,
+`--verify-candidate`, `--verify-claim`, `--question-id`,
+`--fixture-family`, and `--gemel on|off`.
 
 ## 19. Performance contract (Phase-1 hot path targets)
 

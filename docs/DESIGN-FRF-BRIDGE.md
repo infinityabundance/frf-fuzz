@@ -1,7 +1,9 @@
 # FRF Bridge Design (Phase 4)
 
 Verified against `frf 0.1.72` source (`.phase0/forensics/REPORT-frf-0.1.72.md`).
-This document fixes the integration contract; Phase 4 implements it.
+This document fixes the integration contract; **Phase 4 (crate 0.4.0)
+implements it in `src/frf_bridge.rs`** — see `docs/ARCHITECTURE.md` §15 for
+what shipped.
 
 ## Roles
 

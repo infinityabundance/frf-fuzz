@@ -1,5 +1,5 @@
 #!/bin/sh
-# One-command golden demonstration (master prompt §34; Phases 1-3).
+# One-command golden demonstration (master prompt §34; Phases 1-4).
 #
 # Proves end-to-end, on this machine, with the pinned nightly:
 #   1. a target built with the fuzz_target! macro and the instrumented flags
@@ -21,6 +21,13 @@
 #   9. the engine-level precedent demo (acceptance items 10-12: a known
 #      precedent proposes a falsify probe; the probe can support or
 #      contradict; contradiction is durably retained and fsck-verified).
+#  10. Phase 4 (acceptance items 15-17): a campaign with a real FRF
+#      authority court-verifies promoted crash findings and retains the real
+#      receipt ids; a real Gemel repository receives durable boundaries
+#      (campaign checkpoints + verified-finding evidence/claim bound to the
+#      head state); the authority-less control stores stay UNVERIFIED;
+#      `verify` is idempotent; revision tape replay persists revision-
+#      residual pairs across state artifacts.
 #
 # Usage: scripts/golden_demo.sh [nightly]
 set -eu
@@ -158,6 +165,131 @@ cargo run --quiet --bin frf-fuzz -- boundary "$DEPTH_FINDING_ID" \
   --root "$SCRATCH" --bin "$BIN" --nightly "$NIGHTLY" --target golden-demo --max-verify 20000 \
   | tee "$SCRATCH/boundary.out"
 grep -q 'minimized: distance' "$SCRATCH/boundary.out" || { echo "FAIL: boundary minimization did not run"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Phase 4: FRF court verification at promotion + Gemel longitudinal memory
+# ---------------------------------------------------------------------------
+# Acceptance items 15-17:
+#   15. with an authority configured, a promoted crash finding is court-
+#       verified by the real FRF library and linked by its real receipt id;
+#   16. without an authority, the same finding stays explicitly unverified
+#       (the two Phase-1/3 stores above ran authority-less: their reports
+#       must show zero verifications, never a fabricated one);
+#   17. with a Gemel repository present, the promoted/verified result links
+#       to the current Gemel state through durable boundaries (checkpoint on
+#       campaign create/complete; evidence+claim for the verified finding)
+#       with NO per-execution Gemel writes.
+
+echo "=== 11. Phase 4: build the FRF authority (clean reference example) ==="
+cargo build --quiet --example golden_authority || { echo "FAIL: authority build"; exit 1; }
+AUTH="target/debug/examples/golden_authority"
+test -x "$AUTH" || { echo "FAIL: authority not built"; exit 1; }
+
+SCRATCH_P4="$(mktemp -d /tmp/frf-fuzz-demo-p4.XXXXXX)"
+trap 'rm -rf "$SCRATCH" "$SCRATCH_OFF" "$SCRATCH_P4"' EXIT
+
+# A real Gemel repository with a head state (evidence can bind a state).
+echo "=== 12. Phase 4: initialize the Gemel repository ==="
+cargo run --quiet --example phase4_gemel_init -- "$SCRATCH_P4" | tee "$SCRATCH_P4/gemel-init.out"
+grep -q 'gemel repo ready' "$SCRATCH_P4/gemel-init.out" || { echo "FAIL: gemel init"; exit 1; }
+
+mkdir -p "$SCRATCH_P4/seeds"
+printf 'FRFZ\x00\x00AAAA' > "$SCRATCH_P4/seeds/seed-near-gate.bin"
+printf 'FRFZ\x01\x00' > "$SCRATCH_P4/seeds/seed-prefix.bin"
+: > "$SCRATCH_P4/seeds/seed-empty.bin"
+
+echo "=== 13. Phase 4: campaign with FRF authority + Gemel (12s) ==="
+cargo run --quiet --bin frf-fuzz -- run golden-demo \
+  --root "$SCRATCH_P4" \
+  --bin "$BIN" \
+  --workers 8 \
+  --batch-size 1000 \
+  --seed 0xD15EA5E \
+  --seed-dir "$SCRATCH_P4/seeds" \
+  --max-time 12 \
+  --nightly "$NIGHTLY" \
+  --residual on \
+  --authority "$AUTH" \
+  --authority-name demo-ref \
+  --authority-version 1.0 \
+  --gemel on \
+  > "$SCRATCH_P4/run.out" 2>&1 || { tail -20 "$SCRATCH_P4/run.out"; echo "FAIL: phase-4 campaign errored"; exit 1; }
+cat "$SCRATCH_P4/run.out"
+
+# The run banner must state the authority (and that findings are verified).
+grep -q 'FRF authority: demo-ref-1.0' "$SCRATCH_P4/run.out" \
+  || { echo "FAIL: campaign did not report the authority"; exit 1; }
+
+# At least one crash finding was court-verified with a REAL receipt.
+grep -q 'FRF VERIFIED finding=' "$SCRATCH_P4/run.out" \
+  || { echo "FAIL: no FRF-verified finding (court did not reproduce the crash)"; exit 1; }
+VERIFIED_ID="$(sed -n 's/.*FRF VERIFIED finding=\([0-9a-f]*\).*/\1/p' "$SCRATCH_P4/run.out" | head -1)"
+echo "first FRF-verified finding: $VERIFIED_ID"
+
+# Gemel boundaries were published (created + completed at minimum).
+grep -q 'gemel boundary campaign-created' "$SCRATCH_P4/run.out" \
+  || { echo "FAIL: no gemel campaign-created boundary"; exit 1; }
+grep -q 'gemel boundary campaign-completed' "$SCRATCH_P4/run.out" \
+  || { echo "FAIL: no gemel campaign-completed boundary"; exit 1; }
+grep -q 'gemel boundaries: [1-9]' "$SCRATCH_P4/run.out" \
+  || { echo "FAIL: no gemel boundary records persisted"; exit 1; }
+
+echo "=== 14. Phase 4: report + fsck on the verified store ==="
+cargo run --quiet --bin frf-fuzz -- report --root "$SCRATCH_P4" | tee "$SCRATCH_P4/report.out"
+grep -q 'FRF verifications: [1-9]' "$SCRATCH_P4/report.out" \
+  || { echo "FAIL: report shows no FRF verifications"; exit 1; }
+grep -q 'verified: [1-9]' "$SCRATCH_P4/report.out" \
+  || { echo "FAIL: report shows no verified findings"; exit 1; }
+grep -q 'gemel boundaries: [1-9]' "$SCRATCH_P4/report.out" \
+  || { echo "FAIL: report shows no gemel boundaries"; exit 1; }
+cargo run --quiet --bin frf-fuzz -- fsck --root "$SCRATCH_P4" \
+  || { echo "FAIL: fsck found defects in the verified store"; exit 1; }
+
+# Acceptance item 16: the authority-less stores recorded NO verifications
+# (unverified is derived, never fabricated).
+echo "=== 15. Phase 4: authority-less control stays unverified ==="
+cargo run --quiet --bin frf-fuzz -- report --root "$SCRATCH" > "$SCRATCH/control-report.out"
+if grep -q 'FRF verifications: [1-9]' "$SCRATCH/control-report.out"; then
+  echo "FAIL: authority-less store fabricated verifications"
+  exit 1
+fi
+cargo run --quiet --bin frf-fuzz -- report --root "$SCRATCH_OFF" > "$SCRATCH_OFF/control-report.out"
+if grep -q 'FRF verifications: [1-9]' "$SCRATCH_OFF/control-report.out"; then
+  echo "FAIL: coverage-only authority-less store fabricated verifications"
+  exit 1
+fi
+echo "authority-less findings: unverified (control holds)"
+
+echo "=== 16. Phase 4: CLI verify is idempotent with the campaign evidence ==="
+cargo run --quiet --bin frf-fuzz -- verify "$VERIFIED_ID" \
+  --root "$SCRATCH_P4" \
+  --authority "$AUTH" \
+  --authority-name demo-ref \
+  --authority-version 1.0 \
+  --candidate "$BIN" \
+  --gemel off 2>/dev/null | tee "$SCRATCH_P4/verify.out"
+grep -q 'verification: VERIFIED' "$SCRATCH_P4/verify.out" \
+  || { echo "FAIL: CLI verify did not verify the finding"; exit 1; }
+grep -q 'frf receipt: receipt-' "$SCRATCH_P4/verify.out" \
+  || { echo "FAIL: CLI verify returned no receipt"; exit 1; }
+
+echo "=== 17. Phase 4: revision tape replay across states ==="
+cargo run --quiet --bin frf-fuzz -- revision replay "$VERIFIED_ID" \
+  --root "$SCRATCH_P4" \
+  --target golden-demo \
+  --bin "$BIN" \
+  --nightly "$NIGHTLY" \
+  --state rev-A="$BIN" \
+  --state rev-B="$BIN" 2>/dev/null | tee "$SCRATCH_P4/revision.out"
+grep -q 'revision pairs: 1' "$SCRATCH_P4/revision.out" \
+  || { echo "FAIL: revision replay persisted no pair"; exit 1; }
+cargo run --quiet --bin frf-fuzz -- fsck --root "$SCRATCH_P4" \
+  || { echo "FAIL: fsck found defects after revision replay"; exit 1; }
+
+# The Gemel repo received durable evidence for the verified finding.
+BOUNDARY_REC="$(cargo run --quiet --bin frf-fuzz -- report --root "$SCRATCH_P4" --json 2>/dev/null | sed -n 's/.*\"gemel_boundaries\":\([0-9]*\).*/\1/p')"
+echo "gemel boundary records: $BOUNDARY_REC"
+[ "${BOUNDARY_REC:-0}" -ge 3 ] || { echo "FAIL: expected >= 3 gemel boundary records"; exit 1; }
 
 echo
 echo "GOLDEN DEMO PASS"
