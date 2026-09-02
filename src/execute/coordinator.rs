@@ -200,6 +200,13 @@ struct CampaignState {
     morph_identities: std::collections::BTreeSet<u64>,
     /// Per-(root, mutator) lineage state.
     lineages: BTreeMap<(ContentId, u16), LineageState>,
+    /// The DSFB structural substrate per ROOT (all mutator families of a
+    /// root share one behavioral stream: the root's admitted evolution in
+    /// admission order — Phase 3). Created lazily once a root shows
+    /// structure.
+    root_dsfb: BTreeMap<ContentId, LineageSubstrate>,
+    /// Per-root edge ordinal for the substrate (deterministic).
+    root_ordinals: BTreeMap<ContentId, u64>,
     /// Live amplify queue: (frontier, mutator) -> entry.
     amplify: BTreeMap<(ContentId, u16), AmplifyEntry>,
     /// The precedent bank: current revisions keyed by (root, mutator,
@@ -243,14 +250,9 @@ struct CampaignState {
 
 /// One lineage's coordinator-side state.
 struct LineageState {
-    /// The lineage root entry (identity).
-    root: ContentId,
     acc: LineageAccumulator,
     /// Per-signal regime observers (created lazily on first movement).
     observers: BTreeMap<u16, RegimeObserver>,
-    /// The DSFB structural substrate (created lazily once the lineage shows
-    /// structure; Phase 3).
-    substrate: Option<LineageSubstrate>,
     /// Bounded structured-signature history for precedent creation
     /// (oldest first; Phase 3).
     shape_history: VecDeque<(u32, MorphologySignature)>,
@@ -260,52 +262,21 @@ struct LineageState {
     last_verdict_axis: Option<u16>,
     /// The frontier entry (latest admitted descendant).
     frontier: ContentId,
-    /// Edge counter (regime ordinal; deterministic).
+    /// Lineage edge counter (regime ordinal; deterministic).
     ordinal: u64,
 }
 
 impl LineageState {
-    fn new(root: ContentId) -> LineageState {
+    fn new() -> LineageState {
         LineageState {
-            root,
             acc: LineageAccumulator::new(),
             observers: BTreeMap::new(),
-            substrate: None,
             shape_history: VecDeque::new(),
             last_class: 0,
             last_verdict_axis: None,
             frontier: ContentId::new(b""),
             ordinal: 0,
         }
-    }
-
-    /// Feed one admitted edge through the DSFB structural substrate,
-    /// creating the substrate on demand (only lineages that show structure
-    /// pay the substrate's memory). Deterministic; returns the edge's
-    /// structural summary and the closed structural episode when this edge
-    /// completed one.
-    fn feed_structural(
-        &mut self,
-        mutator: u16,
-        edge: &MutationResidual,
-        generation: u32,
-        bridge: &BridgeConfig,
-    ) -> Result<(EdgeStructural, Option<StructuralEpisode>)> {
-        if self.substrate.is_none() {
-            if edge.moved() == 0 {
-                // Nothing structural can come from a fully trivial edge.
-                return Ok((
-                    EdgeStructural {
-                        verdicts: Vec::new(),
-                        any_active: false,
-                    },
-                    None,
-                ));
-            }
-            self.substrate = Some(LineageSubstrate::new(self.root, mutator, bridge)?);
-        }
-        let sub = self.substrate.as_mut().expect("substrate just created");
-        sub.feed_edge(self.ordinal, edge, generation)
     }
 
     /// Record a structured signature in the bounded creation history.
@@ -335,6 +306,8 @@ impl CampaignState {
             state_features: std::collections::BTreeSet::new(),
             morph_identities: std::collections::BTreeSet::new(),
             lineages: BTreeMap::new(),
+            root_dsfb: BTreeMap::new(),
+            root_ordinals: BTreeMap::new(),
             amplify: BTreeMap::new(),
             precedents: BTreeMap::new(),
             probes: BTreeMap::new(),
@@ -407,6 +380,42 @@ impl CampaignState {
         }
     }
 
+    /// Feed one admitted edge into its root's DSFB substrate (per-root
+    /// behavioral stream; the mutator families of one root share it).
+    /// Deterministic; returns the edge's structural summary and the closed
+    /// structural episode when this edge completed one.
+    fn feed_root_structural(
+        &mut self,
+        root: &ContentId,
+        edge: &MutationResidual,
+        generation: u32,
+    ) -> Result<(EdgeStructural, Option<StructuralEpisode>)> {
+        if !self.root_dsfb.contains_key(root) {
+            if edge.moved() == 0 {
+                return Ok((
+                    EdgeStructural {
+                        verdicts: Vec::new(),
+                        any_active: false,
+                    },
+                    None,
+                ));
+            }
+            let sub = LineageSubstrate::new(*root, 0, &self.bridge_cfg)?;
+            self.root_dsfb.insert(*root, sub);
+            self.root_ordinals.insert(*root, 0);
+        }
+        let ordinal = self
+            .root_ordinals
+            .get_mut(root)
+            .expect("ordinal just created");
+        *ordinal = ordinal.wrapping_add(1);
+        let sub = self
+            .root_dsfb
+            .get_mut(root)
+            .expect("substrate just created");
+        sub.feed_edge(*ordinal, edge, generation)
+    }
+
     /// The seed ancestor of an entry (deterministic walk; no cache — the
     /// walk is O(depth) and lineages are shallow).
     fn root_of(&self, index: &CorpusIndex, id: &ContentId) -> Option<ContentId> {
@@ -437,9 +446,8 @@ impl CampaignState {
                 .map(|m| m.signals.clone())
                 .unwrap_or_default();
             let edge = MutationResidual::of(&meta.signals, &parent_signals);
-            let bridge = self.bridge_cfg;
             let ls = self.lineages.entry(key).or_insert_with(|| {
-                let mut ls = LineageState::new(root);
+                let mut ls = LineageState::new();
                 if let Some(root_meta) = index.meta(&root) {
                     ls.acc.init_baseline(&root_meta.signals);
                 }
@@ -476,18 +484,19 @@ impl CampaignState {
                     }
                 }
             }
-            // Phase 3: re-derive the substrate + history in memory. The
-            // returned verdicts/episodes are dropped (their durable objects
-            // were written when the admissions originally happened); only
-            // the machine state must be identical for the resume.
+            // Phase 3: re-derive the root substrate + lineage history in
+            // memory. The returned verdicts/episodes are dropped (their
+            // durable objects were written when the admissions originally
+            // happened); only the machine state must be identical for the
+            // resume.
             if !morph.is_trivial() {
                 ls.push_history(meta.generation, &morph);
             }
-            if self.cfg.policy.residual {
-                let _ = ls.feed_structural(mutator, &edge, meta.generation, &bridge)?;
-            }
             for (signal, ep) in closed {
                 self.write_episode(store, signal, ep)?;
+            }
+            if self.cfg.policy.residual {
+                let _ = self.feed_root_structural(&root, &edge, meta.generation)?;
             }
         }
         Ok(())
@@ -1256,15 +1265,12 @@ fn process_result(
         let key = (root, mutator);
         let residual_on = state.cfg.policy.residual;
         let precedent_on = state.cfg.policy.precedent;
-        let bridge = state.bridge_cfg;
         let regime_cfg = state.regime_cfg;
         // Outputs gathered while the lineage entry is mutably borrowed.
-        let mut structural_verdicts_this_edge = 0u64;
-        let mut closed_structural: Option<StructuralEpisode> = None;
         let mut closed_regime: Vec<(u16, RegimeEpisode)> = Vec::new();
         {
             let ls = state.lineages.entry(key).or_insert_with(|| {
-                let mut ls = LineageState::new(root);
+                let mut ls = LineageState::new();
                 if let Some(root_meta) = index.meta(&root) {
                     ls.acc.init_baseline(&root_meta.signals);
                 }
@@ -1285,52 +1291,61 @@ fn process_result(
                     }
                 }
             }
-            // Phase 3: structured-signature history + the DSFB substrate.
+            // Phase 3: structured-signature history (kept per (root,
+            // mutator) lineage for precedent family identity).
             if !morph.is_trivial() {
                 ls.push_history(generation, &morph);
             }
-            if residual_on {
-                let (es, closed_ep) = ls.feed_structural(mutator, &edge, generation, &bridge)?;
-                // The bank names only structurally active edges; the durable
-                // verdict object records the edge's integer-reduced verdicts
-                // and the nomination.
-                let class = if es.verdicts.iter().any(|v| v.is_active()) {
-                    let mut ev = BankEvidence::new(&morph, &es.verdicts);
-                    for v in &es.verdicts {
-                        ev.set_role(v.axis, state.roles[v.axis as usize]);
-                    }
-                    let bv = classify_evidence(&ev);
-                    let code = bv.motif().map(|m| m.code()).unwrap_or(0);
-                    if code != 0 {
-                        eprintln!(
-                            "[campaign] bank: depth={} class={} axes={:#x}",
-                            generation,
-                            FuzzMotif::from_code(code).map(|m| m.name()).unwrap_or("?"),
-                            morph.axis_mask
-                        );
-                    }
-                    code
-                } else {
-                    0
-                };
-                ls.record_nomination(class, &es.verdicts);
-                // Persist a durable verdict when there is structural
-                // activity or a nomination (Level 1/2 boundary).
-                let persist = es.verdicts.iter().any(|v| v.is_active()) || class != 0;
-                if persist {
-                    let dv = DurableVerdict {
-                        root,
-                        mutator,
-                        depth: generation,
-                        axes: es.verdicts.clone(),
-                        class,
-                        morph_identity: morph.structural_identity(),
-                    };
-                    let payload = encode_verdict_payload(&dv)?;
-                    store.put(Family::StructuralVerdict, &payload)?;
-                    structural_verdicts_this_edge = 1;
+        }
+        // Phase 3: feed the ROOT's DSFB substrate — one shared stream per
+        // root, spanning all mutator families: the root's behavioral
+        // evolution in admission order. This is the stream the DSFB
+        // envelope/grammar semantics are calibrated on.
+        let mut structural_verdicts_this_edge = 0u64;
+        let mut closed_structural: Option<StructuralEpisode> = None;
+        if residual_on {
+            let (es, closed_ep) = state.feed_root_structural(&root, &edge, generation)?;
+            closed_structural = closed_ep;
+            // The bank names only structurally active edges; the durable
+            // verdict object records the edge's integer-reduced verdicts
+            // and the nomination.
+            let class = if es.verdicts.iter().any(|v| v.is_active()) {
+                let mut ev = BankEvidence::new(&morph, &es.verdicts);
+                for v in &es.verdicts {
+                    ev.set_role(v.axis, state.roles[v.axis as usize]);
                 }
-                closed_structural = closed_ep;
+                let bv = classify_evidence(&ev);
+                let code = bv.motif().map(|m| m.code()).unwrap_or(0);
+                if code != 0 {
+                    eprintln!(
+                        "[campaign] bank: depth={} class={} axes={:#x}",
+                        generation,
+                        FuzzMotif::from_code(code).map(|m| m.name()).unwrap_or("?"),
+                        morph.axis_mask
+                    );
+                }
+                code
+            } else {
+                0
+            };
+            if let Some(ls) = state.lineages.get_mut(&key) {
+                ls.record_nomination(class, &es.verdicts);
+            }
+            // Persist a durable verdict when there is structural activity or
+            // a nomination (Level 1/2 boundary).
+            let persist = es.verdicts.iter().any(|v| v.is_active()) || class != 0;
+            if persist {
+                let dv = DurableVerdict {
+                    root,
+                    mutator,
+                    depth: generation,
+                    axes: es.verdicts.clone(),
+                    class,
+                    morph_identity: morph.structural_identity(),
+                };
+                let payload = encode_verdict_payload(&dv)?;
+                store.put(Family::StructuralVerdict, &payload)?;
+                structural_verdicts_this_edge = 1;
             }
         }
         for (signal, ep) in closed_regime {
@@ -1763,7 +1778,7 @@ fn commit_morphology(
         .unwrap_or(pend.parent_id);
     let key = (root, mutator);
     let ls = state.lineages.entry(key).or_insert_with(|| {
-        let mut ls = LineageState::new(root);
+        let mut ls = LineageState::new();
         if let Some(root_meta) = index.meta(&root) {
             ls.acc.init_baseline(&root_meta.signals);
         }

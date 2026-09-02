@@ -103,23 +103,27 @@ pub mod cli;
 /// identity.
 ///
 /// Pinned in Phase 0 after empirical verification across every installed
-/// nightly (LLVM 20.1.1 .. 22.1.2): this is the newest installed toolchain on
-/// which the cargo-fuzz-derived flag set
+/// nightly (LLVM 20.1.1 .. 22.1.2); re-verified on Phase-3 MSRV raise to
+/// `nightly-2026-07-24` (rustc 1.99.0-nightly, LLVM 22.1.8 — the same LLVM
+/// 22 generation, so the cargo-fuzz-derived flag set
 /// (`-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4
 /// -Cllvm-args=-sanitizer-coverage-inline-8bit-counters
 /// -Cllvm-args=-sanitizer-coverage-pc-table
 /// -Cllvm-args=-sanitizer-coverage-trace-compares -Zsanitizer=address`) was
-/// proven end-to-end. See docs/COMPATIBILITY.md.
-pub const DEFAULT_PINNED_NIGHTLY: &str = "nightly-2026-04-21";
+/// proven end-to-end. The coordinator MSRV was raised to 1.98 (the current
+/// stable) by explicit decision during Phase 3, so the pinned nightly (rustc
+/// 1.99.0-nightly) now also satisfies the crate's `rust-version`. See
+/// docs/COMPATIBILITY.md.
+pub const DEFAULT_PINNED_NIGHTLY: &str = "nightly-2026-07-24";
 
 /// The exact rustc identity of [`DEFAULT_PINNED_NIGHTLY`] at pin time
 /// (`rustc -vV`), so a mismatched nightly can be detected instead of silently
 /// used.
-pub const PINNED_NIGHTLY_RUSTC: &str = "rustc 1.97.0-nightly (66da6cae1 2026-04-20)";
+pub const PINNED_NIGHTLY_RUSTC: &str = "rustc 1.99.0-nightly (89c61a754 2026-07-23)";
 /// The exact LLVM identity of [`DEFAULT_PINNED_NIGHTLY`].
-pub const PINNED_NIGHTLY_LLVM: &str = "LLVM version: 22.1.2";
+pub const PINNED_NIGHTLY_LLVM: &str = "LLVM version: 22.1.8";
 /// The exact rustc commit hash of [`DEFAULT_PINNED_NIGHTLY`].
-pub const PINNED_NIGHTLY_COMMIT: &str = "66da6cae1a6f12e9585493ab8f8f19cf753091fd";
+pub const PINNED_NIGHTLY_COMMIT: &str = "89c61a7545da48b06116675b888398d02a4064c7";
 
 /// The minimum supported Rust version for the coordinator build.
 ///

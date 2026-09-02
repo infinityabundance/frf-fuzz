@@ -1,5 +1,5 @@
 #!/bin/sh
-# One-command golden demonstration (master prompt §34; Phase 1 + Phase 2).
+# One-command golden demonstration (master prompt §34; Phases 1-3).
 #
 # Proves end-to-end, on this machine, with the pinned nightly:
 #   1. a target built with the fuzz_target! macro and the instrumented flags
@@ -13,12 +13,19 @@
 #      structured-Unknown), amplified, and followed to a planted depth crash —
 #      while a coverage-only run (`--residual=off`) shows no such signal and
 #      does NOT reach the depth crash within the same budget.
-#   7. `frf-fuzz boundary` two-sided minimization on a stable/crash pair.
+#   7. Phase 3: the depth-crash lineage forms a durable precedent (DSFB
+#      substrate verdicts + FuzzSemanticBank + precedent admission); the
+#      store report shows structural verdicts/precedents and `precedent
+#      list` renders the bank; fsck validates the precedent revision chain.
+#   8. `frf-fuzz boundary` two-sided minimization on a stable/crash pair.
+#   9. the engine-level precedent demo (acceptance items 10-12: a known
+#      precedent proposes a falsify probe; the probe can support or
+#      contradict; contradiction is durably retained and fsck-verified).
 #
 # Usage: scripts/golden_demo.sh [nightly]
 set -eu
 
-NIGHTLY="${1:-nightly-2026-04-21}"
+NIGHTLY="${1:-nightly-2026-07-24}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
@@ -118,6 +125,32 @@ grep -q 'REPRODUCED' "$SCRATCH_OFF/replay.out" || { echo "FAIL: finding did not 
 
 echo "=== 9. fsck the residual-on store ==="
 cargo run --quiet --bin frf-fuzz -- fsck --root "$SCRATCH" || { echo "FAIL: fsck found defects"; exit 1; }
+
+echo "=== 9b. verify Phase-3 endoduction objects in the residual store ==="
+cargo run --quiet --bin frf-fuzz -- report --root "$SCRATCH" | tee "$SCRATCH/report.out"
+grep -q 'structural verdicts: [1-9]' "$SCRATCH/report.out" \
+  || { echo "FAIL: no structural verdict objects (Phase 3 substrate inactive)"; exit 1; }
+grep -q 'precedent families: [1-9]' "$SCRATCH/report.out" \
+  || { echo "FAIL: the depth-crash lineage did not form a durable precedent"; exit 1; }
+
+echo "=== 9c. precedent list renders the bank ==="
+cargo run --quiet --bin frf-fuzz -- precedent list --root "$SCRATCH" | tee "$SCRATCH/precedent.out"
+grep -q 'status=' "$SCRATCH/precedent.out" || { echo "FAIL: precedent list empty"; exit 1; }
+
+# The coverage-only control must NOT have formed precedents (its residual
+# machinery — and therefore its precedent bank — was disabled).
+echo "=== 9d. coverage-only control has no precedents ==="
+cargo run --quiet --bin frf-fuzz -- report --root "$SCRATCH_OFF" > "$SCRATCH_OFF/report.out"
+if grep -q 'precedent families: [1-9]' "$SCRATCH_OFF/report.out"; then
+  echo "FAIL: coverage-only store unexpectedly formed precedents"
+  exit 1
+fi
+echo "coverage-only precedents: 0 (control holds)"
+
+echo "=== 9e. engine-level precedent demo (probe support + contradiction retention) ==="
+cargo run --quiet --example precedent_engine_demo 2>/dev/null | tee "$SCRATCH/precedent-engine.out"
+grep -q 'PRECEDENT ENGINE DEMO PASS' "$SCRATCH/precedent-engine.out" \
+  || { echo "FAIL: precedent engine demo"; exit 1; }
 
 echo "=== 10. two-sided boundary minimization on a stable/crash pair ==="
 DEPTH_FINDING_ID="$(basename "$(grep -l 'marker depth gate' "$SCRATCH"/.frf-fuzz/findings/*.txt 2>/dev/null | head -1)" .txt)"

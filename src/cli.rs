@@ -62,6 +62,7 @@ pub fn run(args: &[String]) -> i32 {
         "tmin" => finish("tmin", cmd_tmin(&args[1..])),
         "cmin" => finish("cmin", cmd_cmin(&args[1..])),
         "boundary" => finish("boundary", cmd_boundary(&args[1..])),
+        "precedent" => finish("precedent", cmd_precedent(&args[1..])),
         "inspect" => finish("inspect", cmd_inspect(&args[1..])),
         "report" => finish("report", cmd_report(&args[1..])),
         "fsck" => finish("fsck", cmd_fsck(&args[1..])),
@@ -107,11 +108,15 @@ fn print_usage() {
          \x20 frf-fuzz run <name> [--workers N] [--batch-size N] [--seed <dir>]\n\
          \x20                 [--max-time <secs>] [--max-execs N] [--sanitizer none|address]\n\
          \x20                 [--nightly <tc>] [--memory-limit-mb N] [--root <path>] [--rebuild]\n\
-         \x20                 [--residual on|off] [--explore-weight N] [--amplify-weight N]\n\
-         \x20 frf-fuzz replay <finding-id> [--root <path>] [--target <name>]\n\
-         \x20 frf-fuzz tmin <finding-id> [--root <path>] [--target <name>] [--max-verify N]\n\
-         \x20 frf-fuzz cmin <name> [--root <path>]\n\
-         \x20 frf-fuzz boundary <finding-id> [--root <path>] [--target <name>] [--max-verify N]\n\
+         \x20                 [--residual on|off] [--precedent on|off]
+         \x20                 [--explore-weight N] [--amplify-weight N]
+         \x20                 [--discriminate-weight N] [--falsify-weight N]
+         \x20 frf-fuzz replay <finding-id> [--root <path>] [--target <name>]
+         \x20 frf-fuzz tmin <finding-id> [--root <path>] [--target <name>] [--max-verify N]
+         \x20 frf-fuzz cmin <name> [--root <path>]
+         \x20 frf-fuzz boundary <finding-id> [--root <path>] [--target <name>] [--max-verify N]
+         \x20 frf-fuzz precedent list [--root <path>]
+         \x20 frf-fuzz precedent show <id> [--root <path>]
          \x20 frf-fuzz inspect <id> [--root <path>]\n\
          \x20 frf-fuzz report [--root <path>] [--json]\n\
          \x20 frf-fuzz fsck [--root <path>]\n\
@@ -1256,11 +1261,28 @@ fn cmd_run(args: &[String]) -> Result<i32> {
             }
         };
     }
+    if let Some(r) = flag_value(args, "--precedent") {
+        policy.precedent = match r.as_str() {
+            "on" | "1" | "true" => true,
+            "off" | "0" | "false" => false,
+            other => {
+                return Err(crate::error::Error::Other(format!(
+                    "--precedent must be on|off (got `{other}`)"
+                )));
+            }
+        };
+    }
     if let Some(w) = flag_value(args, "--explore-weight") {
         policy.class_weights[0] = parse_u64(&w, "--explore-weight")?;
     }
     if let Some(w) = flag_value(args, "--amplify-weight") {
         policy.class_weights[1] = parse_u64(&w, "--amplify-weight")?;
+    }
+    if let Some(w) = flag_value(args, "--discriminate-weight") {
+        policy.class_weights[2] = parse_u64(&w, "--discriminate-weight")?;
+    }
+    if let Some(w) = flag_value(args, "--falsify-weight") {
+        policy.class_weights[3] = parse_u64(&w, "--falsify-weight")?;
     }
     let seed_dir = flag_value(args, "--seed-dir").map(PathBuf::from);
     let max_time = flag_value(args, "--max-time").map(|s| {
@@ -1298,8 +1320,12 @@ fn cmd_run(args: &[String]) -> Result<i32> {
     crate::execute::coordinator::install_sigint_handler();
     eprintln!("[run] target: {}", cfg.target_bin.display());
     eprintln!(
-        "[run] workers: {} batch: {} seed: {:#x} residual: {}",
-        cfg.policy.workers, cfg.policy.batch_size, cfg.policy.seed, cfg.policy.residual
+        "[run] workers: {} batch: {} seed: {:#x} residual: {} precedent: {}",
+        cfg.policy.workers,
+        cfg.policy.batch_size,
+        cfg.policy.seed,
+        cfg.policy.residual,
+        cfg.policy.precedent
     );
     let summary = crate::execute::coordinator::run_campaign(&cfg)?;
     println!(
@@ -1321,6 +1347,21 @@ fn cmd_run(args: &[String]) -> Result<i32> {
     println!("  boundary witnesses: {}", summary.boundaries);
     println!("  run tapes: {}", summary.tapes);
     println!("  amplify orders: {}", summary.amplify_orders);
+    println!(
+        "  structural verdicts: {} episodes: {}",
+        summary.structural_verdicts, summary.structural_episodes
+    );
+    println!(
+        "  precedent revisions: {} matches: {}",
+        summary.precedent_revisions, summary.precedent_matches
+    );
+    println!(
+        "  probe orders: {} support: {} contradict: {} ambiguous: {}",
+        summary.probes_dispatched,
+        summary.probe_supports,
+        summary.probe_contradictions,
+        summary.probe_ambiguous
+    );
     println!("  findings: {}", summary.findings);
     println!("  duration: {:.1}s", summary.duration.as_secs_f64());
     Ok(0)
@@ -1805,6 +1846,71 @@ fn cmd_boundary(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
+/// `frf-fuzz precedent list|show <id>`
+///
+/// Lists the current precedent families of the store, or renders one
+/// precedent revision. Precedents are durable negative/positive knowledge:
+/// list shows status (candidate/confirmed/contradicted) and the falsifiable
+/// probe each family carries.
+fn cmd_precedent(args: &[String]) -> Result<i32> {
+    let root = project_root(args);
+    let store_root = store_root_of(&root);
+    let store = crate::store::Store::open(store_root.clone())?;
+    let sub = args.first().map(|s| s.as_str()).ok_or_else(|| {
+        crate::error::Error::Other("usage: frf-fuzz precedent list|show <id>".into())
+    })?;
+    match sub {
+        "list" => {
+            let current = crate::precedent::load_current(&store)?;
+            if current.is_empty() {
+                println!("no precedents in {}", store_root.display());
+                return Ok(0);
+            }
+            println!("precedents (current revisions): {}", current.len());
+            for p in &current {
+                println!(
+                    "  root={} mutator={} profile_depth={} axes={:#x} status={} supports={} contradictions={}",
+                    short_hex(&p.lineage_root),
+                    p.mutator,
+                    p.profile.depth,
+                    p.profile.axis_mask,
+                    p.status.name(),
+                    p.supports,
+                    p.contradictions
+                );
+            }
+            Ok(0)
+        }
+        "show" => {
+            let id_arg = args.get(1).ok_or_else(|| {
+                crate::error::Error::Other("usage: frf-fuzz precedent show <id>".into())
+            })?;
+            let id = crate::id::ContentId::from_hex(id_arg)?;
+            let Some((family, payload)) = store.get_typed(&id)? else {
+                return Err(crate::error::Error::Other(format!("no object {id}")));
+            };
+            if family != crate::canon::Family::Precedent {
+                return Err(crate::error::Error::Other(format!(
+                    "object {id} is family {} not precedent",
+                    family.name()
+                )));
+            }
+            let p = crate::precedent::decode_precedent(&payload)?;
+            print!("{}", crate::precedent::render_precedent(&p, Some(&id)));
+            Ok(0)
+        }
+        _ => Err(crate::error::Error::Other(format!(
+            "unknown precedent subcommand `{sub}` (expected list|show)"
+        ))),
+    }
+}
+
+/// First 8 hex chars of a content id (display helper).
+fn short_hex(id: &crate::id::ContentId) -> String {
+    let h = id.to_hex();
+    h[..8].to_string()
+}
+
 /// `frf-fuzz inspect <id>`
 fn cmd_inspect(args: &[String]) -> Result<i32> {
     let id = args
@@ -1952,6 +2058,57 @@ fn cmd_inspect(args: &[String]) -> Result<i32> {
                 }
             }
         }
+        crate::canon::Family::StructuralVerdict => {
+            if let Ok(v) = crate::dsfb::debug_bridge::decode_verdict_payload(payload) {
+                println!("lineage root: {}", v.root);
+                println!("mutator: {}", v.mutator);
+                println!("depth: {}", v.depth);
+                println!(
+                    "bank class: {}",
+                    crate::dsfb::fuzz_bank::FuzzMotif::from_code(v.class)
+                        .map(|m| m.name().to_string())
+                        .unwrap_or_else(|| "none/structured-unknown".to_string())
+                );
+                println!("axes ({}):", v.axes.len());
+                for a in &v.axes {
+                    println!(
+                        "  axis {} grammar={} confirmed={} reason={} policy={} dir={} cal={} mag={} pers={}",
+                        a.axis,
+                        a.grammar,
+                        a.confirmed,
+                        a.reason,
+                        a.policy,
+                        a.dir,
+                        a.calibrated,
+                        a.dev_mag_bin,
+                        a.persistence
+                    );
+                }
+            }
+        }
+        crate::canon::Family::StructuralEpisode => {
+            if let Ok(e) = crate::dsfb::debug_bridge::decode_episode_payload(payload) {
+                println!("lineage root: {}", e.root);
+                println!("mutator: {}", e.mutator);
+                println!(
+                    "episode: [{} .. {}] dwell {} peak_policy {}",
+                    e.t_open, e.t_close, e.dwell, e.peak_policy
+                );
+                println!("axes: {:016x}", e.axes);
+                println!("reasons bits: {:#04x}", e.reasons);
+                println!(
+                    "bank class: {}",
+                    crate::dsfb::fuzz_bank::FuzzMotif::from_code(e.class)
+                        .map(|m| m.name().to_string())
+                        .unwrap_or_else(|| "none/structured-unknown".to_string())
+                );
+            }
+        }
+        crate::canon::Family::Precedent => {
+            if let Ok(p) = crate::precedent::decode_precedent(payload) {
+                print!("{}", crate::precedent::render_precedent(&p, Some(&id)));
+            }
+        }
         _ => {
             println!(
                 "payload head: {}",
@@ -2010,6 +2167,15 @@ fn cmd_fsck(args: &[String]) -> Result<i32> {
         failed = true;
         println!("corpus link errors: {}", corpus_errors.len());
         for e in &corpus_errors {
+            println!("  ERROR: {e}");
+        }
+    }
+    let store = crate::store::Store::open(store_root.clone())?;
+    let precedent_errors = crate::precedent::verify_links(&store)?;
+    if !precedent_errors.is_empty() {
+        failed = true;
+        println!("precedent link errors: {}", precedent_errors.len());
+        for e in &precedent_errors {
             println!("  ERROR: {e}");
         }
     }

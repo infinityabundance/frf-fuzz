@@ -142,6 +142,7 @@ const ROLE_RULES: &[RoleRule] = &[
             "invalid",
             "reject",
             "crash",
+            "err",
         ],
     },
     RoleRule {
@@ -965,6 +966,12 @@ fn gate_for(
             // Sustained long outward drift is PersistentBehavioralDrift
             // territory, not recurrent grazing.
             if max_persistence >= 8 && !has_reason(ReasonCode::BoundaryApproach) {
+                return None;
+            }
+            // Grazing requires recurrence: direction flips, a Review-level
+            // zone presence, or at least three consecutive zone touches. A
+            // single Watch-level zone touch is not grazing.
+            if max_slew == 0 && review_count == 0 && max_persistence < 3 {
                 return None;
             }
             let mut score = 4u8;

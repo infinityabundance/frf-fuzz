@@ -82,7 +82,7 @@ sh scripts/golden_demo.sh
 * Coordinator: stable Rust >= 1.85 (MSRV), a C compiler (gemel's bundled
   sqlite).
 * Instrumented fuzz target: the pinned nightly
-  (`nightly-2026-04-21`; `rustup toolchain install nightly-2026-04-21`) —
+  (`nightly-2026-07-24`; `rustup toolchain install nightly-2026-07-24`) —
   LLVM SanitizerCoverage and sanitizer flags require nightly. The exact
   nightly identity is verified by `frf-fuzz doctor` and recorded in campaign
   metadata; a mismatched nightly is never silently used.

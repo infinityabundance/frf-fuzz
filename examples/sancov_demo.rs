@@ -10,7 +10,7 @@
 //!   -Cllvm-args=-sanitizer-coverage-pc-table \
 //!   -Cllvm-args=-sanitizer-coverage-trace-compares \
 //!   -Clto=off -Cpanic=abort" \
-//!   cargo +nightly-2026-04-21 run --example sancov_demo
+//!   cargo +nightly-2026-07-24 run --example sancov_demo
 //! ```
 //!
 //! What this proves end-to-end with the crate's own runtime:

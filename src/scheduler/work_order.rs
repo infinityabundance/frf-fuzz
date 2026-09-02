@@ -261,7 +261,7 @@ pub struct Hello {
     pub total_counter_bytes: u64,
     /// Worker process ID (diagnostics only; never part of identity).
     pub pid: u32,
-    /// `rustc -vV` release line, e.g. "1.97.0-nightly".
+    /// `rustc -vV` release line, e.g. "1.99.0-nightly".
     pub rustc_release: String,
     /// `rustc -vV` LLVM line.
     pub llvm_version: String,
@@ -1184,8 +1184,8 @@ mod tests {
             range_count: 2,
             total_counter_bytes: 1024,
             pid: 42,
-            rustc_release: "1.97.0-nightly".into(),
-            llvm_version: "LLVM version: 22.1.2".into(),
+            rustc_release: "1.99.0-nightly".into(),
+            llvm_version: "LLVM version: 22.1.8".into(),
             schema: vec![
                 SignalDescWire {
                     id: 0,

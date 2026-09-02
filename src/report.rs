@@ -57,6 +57,14 @@ pub struct Report {
     pub boundaries: u64,
     /// Closed regime episodes written.
     pub regime_episodes: u64,
+    /// Structural verdict objects (Phase 3).
+    pub structural_verdicts: u64,
+    /// Structural episodes (Phase 3).
+    pub structural_episodes: u64,
+    /// Current precedent families (Phase 3; current revisions only).
+    pub precedents: u64,
+    /// Precedent revisions stored (all).
+    pub precedent_revisions: u64,
     /// Signal schema objects.
     pub signal_schemas: u64,
     /// Refs (name -> id hex), sorted.
@@ -113,12 +121,19 @@ pub fn generate(store_root: &std::path::Path) -> Result<Report> {
             Family::MorphologySignature => report.morphologies += 1,
             Family::BoundaryWitness => report.boundaries += 1,
             Family::RegimeEpisode => report.regime_episodes += 1,
+            Family::StructuralVerdict => report.structural_verdicts += 1,
+            Family::StructuralEpisode => report.structural_episodes += 1,
+            Family::Precedent => report.precedent_revisions += 1,
             Family::SignalSchema => report.signal_schemas += 1,
             _ => {}
         }
     }
     report.campaign_ids.sort();
     report.findings.sort_by_key(|f| f.id.to_hex());
+    // Current precedent families (resolve deterministically from revisions).
+    let store_ref = Store::open(store_root.to_path_buf())?;
+    let current = crate::precedent::load_current(&store_ref)?;
+    report.precedents = current.len() as u64;
 
     // Corpus stats (rebuild the disposable index from durable metadata).
     let index = CorpusIndex::rebuild(&store)?;
@@ -158,6 +173,12 @@ pub fn render_human(r: &Report) -> String {
     s.push_str(&format!("morphologies: {}\n", r.morphologies));
     s.push_str(&format!("boundary witnesses: {}\n", r.boundaries));
     s.push_str(&format!("regime episodes: {}\n", r.regime_episodes));
+    s.push_str(&format!("structural verdicts: {}\n", r.structural_verdicts));
+    s.push_str(&format!("structural episodes: {}\n", r.structural_episodes));
+    s.push_str(&format!(
+        "precedent families: {} ({} revisions)\n",
+        r.precedents, r.precedent_revisions
+    ));
     s.push_str(&format!("signal schemas: {}\n", r.signal_schemas));
     s.push_str(&format!("findings: {}\n", r.findings.len()));
     for f in &r.findings {
@@ -194,8 +215,8 @@ pub fn render_json(r: &Report) -> String {
             .unwrap_or_else(|| "null".to_string())
     ));
     s.push_str(&format!(
-        "\"corpus_entries\":{},\"corpus_features\":{},\"state_features\":{},\"tapes\":{},\"morphologies\":{},\"boundaries\":{},\"regime_episodes\":{},\"signal_schemas\":{},\"findings\":[",
-        r.corpus_entries, r.corpus_features, r.state_features, r.tapes, r.morphologies, r.boundaries, r.regime_episodes, r.signal_schemas
+        "\"corpus_entries\":{},\"corpus_features\":{},\"state_features\":{},\"tapes\":{},\"morphologies\":{},\"boundaries\":{},\"regime_episodes\":{},\"structural_verdicts\":{},\"structural_episodes\":{},\"precedent_families\":{},\"precedent_revisions\":{},\"signal_schemas\":{},\"findings\":[",
+        r.corpus_entries, r.corpus_features, r.state_features, r.tapes, r.morphologies, r.boundaries, r.regime_episodes, r.structural_verdicts, r.structural_episodes, r.precedents, r.precedent_revisions, r.signal_schemas
     ));
     for (i, f) in r.findings.iter().enumerate() {
         if i > 0 {

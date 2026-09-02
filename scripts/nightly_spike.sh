@@ -14,7 +14,7 @@
 # Usage: scripts/nightly_spike.sh [nightly]
 set -eu
 
-NIGHTLY="${1:-nightly-2026-04-21}"
+NIGHTLY="${1:-nightly-2026-07-24}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 

@@ -9,7 +9,7 @@
 # Usage: scripts/cli_smoke.sh [nightly]
 set -eu
 
-NIGHTLY="${1:-nightly-2026-04-21}"
+NIGHTLY="${1:-nightly-2026-07-24}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRATCH="$(mktemp -d /tmp/frf-fuzz-cli.XXXXXX)"
 trap 'rm -rf "$SCRATCH"' EXIT

@@ -7,7 +7,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # The pinned nightly for instrumented-build verification.
-  NIGHTLY: nightly-2026-04-21
+  NIGHTLY: nightly-2026-07-24
 
 jobs:
   msrv:
@@ -54,8 +54,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Verify nightly identity
         run: |
-          rustc +${{ env.NIGHTLY }} -vV | grep 'LLVM version: 22.1.2'
-          rustc +${{ env.NIGHTLY }} -vV | grep '66da6cae1a6f12e9585493ab8f8f19cf753091fd'
+          rustc +${{ env.NIGHTLY }} -vV | grep 'LLVM version: 22.1.8'
+          rustc +${{ env.NIGHTLY }} -vV | grep '89c61a7545da48b06116675b888398d02a4064c7'
       - name: Run the nightly instrumentation spike
         run: sh scripts/nightly_spike.sh ${{ env.NIGHTLY }}
 
