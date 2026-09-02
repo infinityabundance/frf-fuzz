@@ -429,11 +429,99 @@ machine) — never in the per-execution loop.
 - Docs: `ARCHITECTURE.md` §3 + §17 + §18, `COMPATIBILITY.md` §6,
   `DEPENDENCIES.md`, `INVARIANTS.md` I8/I15, `README.md` status.
 
-## Phase 8 — Scientific Evaluation
+## Phase 8 — Scientific Evaluation (DONE)
 
-- Ablations (mandatory ladder), historical defects with held-out partition,
-  repeated trials, A12 / Mann-Whitney U from exported raw series,
-  baselines vs cargo-fuzz/libFuzzer and AFL++.
+- The experiment instrument (`frf-fuzz experiment`, `src/experiment/`):
+  repeated independent trials over the four code-level ablation arms, raw
+  series export, and non-parametric comparison.
+  - Arms = frozen deltas over the campaign's three feedback switches
+    (protocol §2 ladder rungs 1-5): `cov` (cmp off, residual off, precedent
+    off) -> `cov+cmp` -> `residual` -> `full`. Rungs 6-9 are orthogonal
+    axes, documented, not switches: Gemel revision memory (durable
+    boundaries, Phase 4), AVX2 (measured constant, I3), GPU (unadmitted,
+    Phase 7), full system = `full` + a configured FRF authority.
+  - **New honest ablation switch `--cmp on|off`**: with cmp off the
+    const-compare dictionary discovery is gated, the dictionary/compare
+    mutation families leave the Explore rotation (`MutatorId::
+    WITHOUT_CMP_GUIDED`, locked by test), and the worker skips cmp-ring
+    reset/snapshot/substitution (env `FRF_FUZZ_CMP`). `--residual off` was
+    already coverage-only in spirit but still carried the Phase-2
+    morphology/state-feature persistence: those are now residual-gated too
+    (a coverage-only corpus stores no morphology objects, counts no state
+    features, feeds no regime/lineage machinery — the ablation arms are
+    semantically clean, not just scheduler-degenerate).
+  - Trial hygiene: fresh store per trial, deterministic per-trial seeds
+    (splitmix64 over base seed + trial; shared across arms so arms differ
+    only in their feedback channels), budget-mandated (`--max-time` /
+    `--max-execs` required: trials are right-censored by design).
+  - Censoring discipline: time/executions-to-first-failure trials that find
+    nothing are exported as `NA` rows and reported as found/censored counts
+    per arm — never silently dropped; arm-pair A12/MWU on censored metrics
+    uses the labeled complete-case subset.
+  - `experiment/stats.rs`: dependency-free median/quartiles, Vargha-Delaney
+    A12, Mann-Whitney U (normal approximation, continuity + tie correction,
+    self-contained `erfc`). Property-locked against hand values, identical
+    samples (A12 = 0.5, p = 1), full separation (A12 = 0/1), ties, and the
+    direction reversal.
+  - `experiment/mod.rs`: `AblationArm`/`Metric` tables (codes locked by
+    test), series CSV export with the protocol §3 mandatory metadata in
+    `#` comment lines + `read_series` re-import (malformed/non-finite rows
+    refused), deterministic experiment id (excludes paths and wall clocks),
+    host/environment record, JSON + human analysis with the fixed power
+    caveat (I11: the CLI never bakes an unsupported statistical claim).
+  - Held-out partition (`held_out_split`): deterministic Fisher-Yates over
+    a splitmix64 stream; disjoint, recorded, reproducible development/blind
+    splits for the protocol §4 benchmark-leakage control.
+- Executable demonstrations:
+  - `scripts/phase8_ablation_demo.sh` (run via the pinned nightly): builds
+    the golden-demo target and runs `frf-fuzz experiment golden-demo
+    --arms cov,cov+cmp,residual,full --trials 2 --max-time 10`.
+    Assertions: cov/cov+cmp record zero morphologies/regime
+    episodes/amplify orders/precedent matches in every trial (negative
+    control: no residual machinery, no trajectory); cov+cmp reaches the
+    magic gate; residual/full retain the Path-B trajectory (morphologies >
+    0 and a state-feature space beyond the seed baseline in every trial)
+    and reach failures; the exported series is the recomputation authority
+    (metadata record, row count, JSON well-formedness, power caveat).
+  - `scripts/baseline_compare.sh`: cargo-fuzz/libFuzzer baseline of the
+    same golden gates (scratch `fuzz/` package built outside this crate,
+    `#![no_main]` harness, pinned nightly, ASan); AFL++ skipped with a
+    recorded message when not installed. Informational single trials only,
+    labeled as such (protocol §9: never publication evidence).
+  - `scripts/cli_smoke.sh` now exercises the experiment CLI surface
+    (budget/arm-switch argument guards + a 2-arm smoke with JSON + record
+    checks).
+- Measured on this machine (informational; demo trial counts — the analysis
+  output says so and so does this record): 4 arms x 2 trials x 10 s on the
+  golden-demo target, 8 workers. Coverage-only runs ~143k exec/s and
+  reaches the magic gate only blindly (~340k execs, 1/2 trials); cov+cmp
+  runs ~108k exec/s, finds the gate in 2/2 trials at ~472k execs; the
+  residual arms run ~53k exec/s (residual analysis + crash restarts cost
+  throughput) but reach the Path-B failure at ~84k execs / ~1.24 s in 2/2
+  trials — about 6x fewer executions and ~3.5x less wall time than cov+cmp
+  — and are the only arms with a retained trajectory (33 drift state
+  features vs the 1-bucket seed baseline, 5.5 morphology identities, ~108
+  amplify orders, 12 boundary witnesses). Honest observations recorded:
+  closed regime episodes are 0 even in the residual arms because the
+  ladder's lineages END in crashes while still InEpisode (an episode closes
+  on recovery/collapse; open trajectories are the live observation —
+  episode formation/close semantics stay pinned at engine level in
+  `tests/residual_semantics.rs`), and precedent/probe activity needs longer
+  campaigns than 10 s (the 15 s+ golden-demo campaign demonstrates it). At
+  demo budgets the magic gate is not cmp-exclusive: the near-gate seed +
+  classic integer/boundary mutators can co-evolve `0xBEEF` blind in ~340k
+  execs — compare guidance is a reliability/speed channel here, and the
+  load-bearing claim is the trajectory one. Publication-grade conclusions
+  need the FuzzBench-scale repeated-trial protocol; the machinery is real
+  and the exports preserve every raw series.
+- Tests: `tests/phase8_experiment.rs` (export -> import -> recompute
+  identity, censoring survival, held-out disjointness/leakage guard,
+  identical-arms negative control A12 = 0.5/p = 1, hostile export refusal,
+  caveat presence) + `experiment` unit tests (arm/metric table locks, seed
+  derivation, CSV round trip, complete-case comparisons, experiment-id
+  path/time exclusion).
+- Docs: `EXPERIMENT_PROTOCOL.md` §2-§5 implementation record,
+  `ARCHITECTURE.md` §22, `README.md` status.
 
 ## Non-goals for V1 (explicit)
 

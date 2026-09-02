@@ -64,9 +64,24 @@ configuration. The ablation ladder (each step ADDs one feedback channel):
 8. + GPU
 9. full system
 
-Baselines where practical: cargo-fuzz / libFuzzer, AFL++, and any relevant
-modern fuzzer available in the environment. Baselines must be built from
-their pinned/current upstream with documented versions.
+The four code-level arms are live (ladder rungs 1-5 collapsed over the three
+feedback switches; `frf-fuzz experiment <target> --arms ...`): rung 1 is the
+`cov` arm, rung 2 is `cov+cmp`, rungs 3-4 are `residual`, rung 5 is `full`.
+`--cmp on|off` is the honest compare switch (off gates const-compare
+dictionary seeding, the dictionary/compare mutation families, and worker
+cmp-ring collection); `--residual off` additionally gates morphology
+persistence and state-feature admission, so each arm differs only in its
+feedback channels — no residual machinery runs under `cov`. Rungs 6-9 are
+documented orthogonal axes, not switches: Gemel revision memory (durable
+boundaries, Phase 4), the AVX2 measured constant (I3), the GPU (unadmitted,
+Phase 7), and the full system = the `full` arm + a configured FRF authority.
+
+Baselines where practical: `scripts/baseline_compare.sh` runs the cargo-fuzz
+/ libFuzzer baseline of the same golden gates (cargo-fuzz 0.13.2 is
+installed on the development machine; AFL++ is skipped with a recorded
+message when absent), plus any relevant modern fuzzer available in the
+environment. Baselines must be built from their pinned/current upstream with
+documented versions.
 
 ## 3. Benchmark hygiene
 
@@ -105,6 +120,26 @@ Mann-Whitney U. Export formats must preserve the raw time series so these
 statistics can be recomputed; the CLI never bakes unsupported statistical
 claims into its output (it reports raw facts; analysis is the analyst's job).
 
+### Phase 8 implementation record
+
+The instrument ships in the crate (`src/experiment/`, coordinator feature;
+`frf-fuzz experiment <target>`): repeated independent trials, each with its
+own fresh store and a deterministic per-trial seed (shared across arms), and
+a mandatory `--max-time` / `--max-execs` censoring budget. Raw series export
+to `<out>/<expid>/<ts>/series.csv` (default `<root>/.frf-fuzz/experiments`)
+carries the metadata set above in `#` comment lines, alongside
+`analysis.txt` and `meta.json`; human and `--json` output. Trials whose
+first-failure time/executions fall beyond the budget are exported as `NA`
+rows and reported as found/censored per arm — never silently dropped;
+arm-pair A12/Mann-Whitney U on censored metrics uses the labeled
+complete-case subset. Statistics (median/quartiles, Vargha-Delaney A12,
+Mann-Whitney U two-sided) are dependency-free and recomputable from the
+exported series. Measured demo numbers (informational; demo trial counts)
+are recorded in ROADMAP Phase 8 (`scripts/phase8_ablation_demo.sh`,
+`scripts/baseline_compare.sh`); at demo trial counts every conclusion is
+explicitly non-evidence — publication-grade comparison needs the
+FuzzBench-scale protocol above.
+
 ## 4. Benchmark leakage controls
 
 * Held-out defects: a historical failure used to CREATE a precursor
@@ -118,6 +153,10 @@ claims into its output (it reports raw facts; analysis is the analyst's job).
   recorded.
 * No mid-campaign changes: an evaluation campaign's config is immutable once
   started; `frf-fuzz fsck` and campaign records make this auditable.
+
+The held-out control machinery ships with the crate:
+`experiment::held_out_split(defect_ids, blind_fraction, seed)` derives the
+deterministic, disjoint, recorded development/blind partition above.
 
 ## 5. Negative controls (required, Phase 2+)
 
@@ -158,10 +197,21 @@ The golden-demo control (`scripts/golden_demo.sh`) verifies the coverage-
 only store forms 0 precedents while the residual-on store forms its durable
 precedent family.
 
-The ablation switches are now live: `--residual off` degenerates to
-coverage-only, `--precedent off` disables matching/probes, and the per-class
-weights (`--explore-weight`, `--amplify-weight`, `--discriminate-weight`,
-`--falsify-weight`) tune the scheduling ladder for the §2 ablations.
+The ablation switches are now live: `--cmp on|off` (Phase 8 — off gates
+const-compare dictionary seeding, the dictionary/compare mutation families,
+and worker cmp-ring collection), `--residual off` degenerates to
+coverage-only (morphology/state-feature persistence is residual-gated, so no
+residual machinery runs under it), `--precedent off` disables
+matching/probes, and the per-class weights (`--explore-weight`,
+`--amplify-weight`, `--discriminate-weight`, `--falsify-weight`) tune the
+scheduling ladder for the §2 ablations.
+
+### Phase 8 negative controls — implemented
+
+The trajectory claim's §5 control ships as `scripts/phase8_ablation_demo.sh`:
+it asserts the `cov` and `cov+cmp` arms record zero morphology/regime/
+amplify/precedent state in every trial while the residual arms retain the
+Path-B trajectory.
 
 ## 6. The golden demonstration target (Phase 1 acceptance; spec §34)
 

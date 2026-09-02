@@ -1,6 +1,6 @@
 # frf-fuzz Dependency Policy and Pin Record
 
-Status: Phase 7. Every dependency exists for a recorded reason. Versions are
+Status: Phase 8. Every dependency exists for a recorded reason. Versions are
 pinned (`=`) for integration-sensitive crates. The core default build stays
 small enough to audit; the target-runtime build is dependency-tiny.
 
@@ -48,6 +48,11 @@ of 1.85.
   dependencies.
 * **No rand**: determinism is counter-based Philox, our own implementation
   with official KAT vectors.
+* **No new dependencies in Phase 8**: the experiment statistics
+  (median/quartiles, Vargha-Delaney A12, Mann-Whitney U) are self-contained
+  in `src/experiment/stats.rs`, and the experiment's series CSV / JSON /
+  analysis writers are hand-rolled in the same spirit as the doctor's
+  `--json` writer above.
 
 ## Procurement (Phase 0, from source, not docs.rs)
 

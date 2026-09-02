@@ -115,6 +115,11 @@ pub struct SchedulePolicy {
     /// Residual-guided admission/amplification (the ablation switch:
     /// `false` degenerates to Phase-1 coverage-only).
     pub residual: bool,
+    /// Compare-guided feedback (the Phase-8 ablation switch: `false` disables
+    /// const-compare dictionary discovery, the dictionary/compare mutation
+    /// families, and worker-side cmp collection, degenerating the campaign to
+    /// true coverage-only). See docs/EXPERIMENT_PROTOCOL.md §2.
+    pub cmp: bool,
     /// Precedent-guided scheduling (the Phase-3 ablation switch: `false`
     /// disables matching/probes; only meaningful when `residual` is on).
     pub precedent: bool,
@@ -139,6 +144,7 @@ impl Default for SchedulePolicy {
             max_corpus_entries: crate::corpus::MAX_CORPUS_ENTRIES,
             max_features_per_order: crate::scheduler::work_order::MAX_FEATURES_PER_ORDER,
             residual: true,
+            cmp: true,
             precedent: true,
             class_weights: [4, 1, 1, 1],
             amplify_min_count: 4,
@@ -298,7 +304,9 @@ impl OrderPlanner {
     }
 
     /// Build the plan for lane `lane`, starting at mutation index
-    /// `start_index` for parent `parent_short` (Explore: rotated family).
+    /// `start_index` for parent `parent_short` (Explore: rotated family over
+    /// the policy's active family table — with compare guidance off the
+    /// cmp-guided families cannot be picked, Phase 8).
     pub fn plan_for(
         &mut self,
         lane: u16,
@@ -306,7 +314,8 @@ impl OrderPlanner {
         generation: u32,
         start_index: u64,
     ) -> OrderPlan {
-        let mutator = MutatorId::ALL[self.rotation % MutatorId::ALL.len()];
+        let table = MutatorId::table(self.policy.cmp);
+        let mutator = table[self.rotation % table.len()];
         self.rotation += 1;
         OrderPlan {
             lane,
@@ -444,6 +453,38 @@ mod tests {
             seen.insert(pa.mutator);
         }
         assert_eq!(seen.len(), MutatorId::ALL.len());
+    }
+
+    #[test]
+    fn cmp_off_rotation_never_picks_cmp_guided_families() {
+        // Phase-8 coverage-only arm: with `cmp = false` the Explore rotation
+        // is confined to the cmp-free subset, deterministically, and the
+        // dictionary/compare families can never be dispatched.
+        let policy = SchedulePolicy {
+            cmp: false,
+            ..SchedulePolicy::default()
+        };
+        let mut a = OrderPlanner::new(&policy);
+        let mut b = OrderPlanner::new(&policy);
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..(MutatorId::WITHOUT_CMP_GUIDED.len() * 3) {
+            let pa = a.plan_for(1, [0; 8], 0, i as u64);
+            let pb = b.plan_for(1, [0; 8], 0, i as u64);
+            assert_eq!(pa.mutator, pb.mutator, "planners must agree");
+            assert!(
+                MutatorId::WITHOUT_CMP_GUIDED.contains(&pa.mutator),
+                "cmp-off rotation picked a cmp-guided family"
+            );
+            seen.insert(pa.mutator);
+        }
+        assert_eq!(seen.len(), MutatorId::WITHOUT_CMP_GUIDED.len());
+        // With cmp back on, the full family set is reachable again.
+        let mut on = OrderPlanner::new(&SchedulePolicy::default());
+        let mut full = std::collections::BTreeSet::new();
+        for i in 0..(MutatorId::ALL.len() * 3) {
+            full.insert(on.plan_for(1, [0; 8], 0, i as u64).mutator);
+        }
+        assert_eq!(full.len(), MutatorId::ALL.len());
     }
 
     #[test]

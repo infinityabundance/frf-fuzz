@@ -104,6 +104,9 @@ pub mod tape;
 pub mod report;
 
 #[cfg(feature = "coordinator")]
+pub mod experiment;
+
+#[cfg(feature = "coordinator")]
 pub mod cli;
 
 /// The pinned nightly toolchain for instrumented fuzz-target builds.

@@ -135,6 +135,16 @@ fn verified_finding_receives_a_real_receipt_and_is_idempotent() {
     // Re-verifying the identical finding + authority converges on the SAME
     // record object (FRF immutability + content addressing) and reuses the
     // identical FRF evidence.
+    //
+    // NOTE (Phase 8, observed): FRF's run evidence is content-addressed over
+    // its real side-process capture, and under EXTREME machine contention
+    // (e.g. several concurrent `cargo` batteries saturating all cores) the
+    // captured evidence can differ run-to-run, so this convergence assertion
+    // is load-sensitive. It passes reliably on an idle machine (verified
+    // before and after the Phase-8 changes); the nondeterminism lives inside
+    // the real `frf` library and is deliberately NOT reimplemented here
+    // (I4). If this test ever fails in a CI log, first re-run it alone on an
+    // idle machine before treating it as a regression.
     let (rec_id2, rec2) = frf_bridge::verify_and_persist(
         &store,
         &finding_id,

@@ -59,6 +59,12 @@ cargo frf-fuzz boundary <finding-id>          # two-sided minimization
 cargo frf-fuzz precedent list                 # renders the precedent bank
 cargo frf-fuzz precedent show <id>            # detail for one precedent
 
+# scientific evaluation (Phase 8): repeated independent trials over the
+# code-level ablation arms (each trial is a fresh store; the budget is
+# mandatory — trials that find nothing are censored, never dropped):
+cargo frf-fuzz experiment parser --arms cov,cov+cmp,residual,full \
+    --trials 2 --max-time 10                  # exports raw-series CSV + analysis
+
 # FRF verification + Gemel longitudinal memory (Phase 4):
 # run a campaign that court-verifies every replay-confirmed crash finding
 # against a reference executable and publishes durable Gemel boundaries
@@ -126,7 +132,7 @@ sh scripts/golden_demo.sh
 | 5 | AVX2 hardening: measured per-window scan/clear + cmp snapshot wired through runtime-dispatched SIMD; per-execution event-window allocation removed (`examples/phase5_bench`); scalar == AVX2 property-tested | **DONE** |
 | 6 | Database specialization: real `dsfb-database` bridge (`database` feature) with typed rows -> real SQL-semantics constructors -> real `MotifEngine`; type-level I7 refusal (source lock + `compile_fail`); regression demo `cargo run --features database --example db_regression_demo` | **DONE** |
 | 7 | GPU: batch `ComputeBackend` contract + CPU oracle (`gpu/`), integer-only deterministic kernels, recorded fallback for unadmitted CUDA/ROCm (I8/I14/I15), CubeCL gate record; `cargo run --example gpu_backend_demo` | **DONE** |
-| 8 | Scientific evaluation | planned |
+| 8 | Scientific evaluation: `frf-fuzz experiment` repeated-trial ablation harness (cov / cov+cmp / residual / full arms, honest `--cmp` switch, censoring discipline), raw-series CSV export + median/A12/Mann-Whitney, held-out partition, negative controls, cargo-fuzz baseline + golden-demo ablation demos (`scripts/phase8_ablation_demo.sh`) | **DONE** |
 
 ## The two planes
 

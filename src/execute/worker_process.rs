@@ -39,6 +39,9 @@ pub const ENV_TIMEOUT_MS: &str = "FRF_FUZZ_TIMEOUT_MS";
 pub const ENV_WORKER_ID: &str = "FRF_FUZZ_WORKER_ID";
 /// Optional RLIMIT_AS in MiB (0 = no limit).
 pub const ENV_MEMORY_LIMIT_MB: &str = "FRF_FUZZ_MEMORY_LIMIT_MB";
+/// Compare-guidance switch: "0" = coverage-only worker (Phase-8 ablation
+/// arm; the worker skips cmp-ring reset/snapshot and substitution hits).
+pub const ENV_CMP: &str = "FRF_FUZZ_CMP";
 
 /// Sanitizer mode string passed via [`ENV_SANITIZER`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +53,8 @@ pub enum SanitizerMode {
 }
 
 impl SanitizerMode {
-    fn env_value(self) -> &'static str {
+    /// The sanitizer name (`"none"` or `"address"`).
+    pub fn env_value(self) -> &'static str {
         match self {
             SanitizerMode::None => "none",
             SanitizerMode::Address => "address",
@@ -134,7 +138,8 @@ impl WorkerHandle {
             .env(ENV_SANITIZER, sanitizer.env_value())
             .env(ENV_TIMEOUT_MS, policy.timeout_ms.to_string())
             .env(ENV_WORKER_ID, lane.to_string())
-            .env(ENV_MEMORY_LIMIT_MB, memory_limit_mb.to_string());
+            .env(ENV_MEMORY_LIMIT_MB, memory_limit_mb.to_string())
+            .env(ENV_CMP, if policy.cmp { "1" } else { "0" });
         let mut child = cmd.spawn().map_err(|e| {
             Error::Other(format!(
                 "cannot spawn worker binary {}: {e}",

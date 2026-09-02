@@ -78,8 +78,13 @@ pub const ENV_LEDGER: &str = "FRF_FUZZ_LEDGER";
 pub const ENV_LANE: &str = "FRF_FUZZ_LANE";
 /// Sanitizer mode: "none" (sancov+tracecmp) or "address" (ASan).
 pub const ENV_SANITIZER: &str = "FRF_FUZZ_SANITIZER";
-/// Per-execution timeout in milliseconds.
+/// Per-execution watchdog timeout in milliseconds.
 pub const ENV_TIMEOUT_MS: &str = "FRF_FUZZ_TIMEOUT_MS";
+/// Compare-guidance switch: "0" disables cmp-ring reset/snapshot and the
+/// cmp-guided substitution hits (Phase-8 coverage-only ablation arm; the
+/// callbacks still fire in the instrumented binary, but their events are
+/// never read). Absent/any other value = enabled.
+pub const ENV_CMP: &str = "FRF_FUZZ_CMP";
 /// Worker ordinal (diagnostics).
 pub const ENV_WORKER_ID: &str = "FRF_FUZZ_WORKER_ID";
 /// Optional RLIMIT_AS in MiB (0 = no limit).
@@ -151,6 +156,7 @@ fn run_inner() -> Result<i32> {
         ledger,
         cx,
         timeout_ms: cfg.timeout_ms,
+        cmp_enabled: cfg.cmp_enabled,
         footprint_set: BTreeSet::new(),
         scan_buf,
         events_buf,
@@ -244,6 +250,7 @@ struct WorkerConfig {
     mode: u8,
     timeout_ms: u64,
     memory_limit_mb: u64,
+    cmp_enabled: bool,
 }
 
 impl WorkerConfig {
@@ -261,11 +268,15 @@ impl WorkerConfig {
             return Err(Error::Encoding("FRF_FUZZ_TIMEOUT_MS must be > 0"));
         }
         let memory_limit_mb = env_u64(ENV_MEMORY_LIMIT_MB)?.unwrap_or(0);
+        // Compare guidance defaults ON; only the coordinator's explicit
+        // "0" disables it (Phase-8 coverage-only arm).
+        let cmp_enabled = !matches!(env_str(ENV_CMP)?.as_deref(), Some("0"));
         Ok(WorkerConfig {
             ledger_path,
             mode,
             timeout_ms,
             memory_limit_mb,
+            cmp_enabled,
         })
     }
 }
@@ -351,6 +362,8 @@ struct Worker {
     cx: FuzzContext,
     /// Per-execution timeout in milliseconds (the SIGALRM deadline).
     timeout_ms: u64,
+    /// Compare-guidance switch (Phase-8 coverage-only ablation arm).
+    cmp_enabled: bool,
     /// Sorted footprint packed indices (permanently masked).
     footprint_set: BTreeSet<u64>,
     /// Scan scratch (one slot per counter byte).
@@ -543,19 +556,26 @@ impl Worker {
             parent: &order.parent,
             rng: &mut rng,
             dictionary,
-            cmp_hits: &self.last_cmp_hits,
+            cmp_hits: if self.cmp_enabled {
+                &self.last_cmp_hits
+            } else {
+                &[]
+            },
             splice_partner: partner,
             influence: None,
         };
-        let hits_used: Vec<CmpHitWire> = self
-            .last_cmp_hits
-            .iter()
-            .take(MAX_CMP_HITS_PER_EXEC)
-            .map(|h| CmpHitWire {
-                width: h.width() as u8,
-                value: h.value(),
-            })
-            .collect();
+        let hits_used: Vec<CmpHitWire> = if self.cmp_enabled {
+            self.last_cmp_hits
+                .iter()
+                .take(MAX_CMP_HITS_PER_EXEC)
+                .map(|h| CmpHitWire {
+                    width: h.width() as u8,
+                    value: h.value(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let out = mutation::apply(mutator, &mut input)?;
         if out.changed {
             Ok((out.bytes, hits_used))
@@ -597,7 +617,14 @@ impl Worker {
         data: &[u8],
     ) -> Result<WindowOutcome> {
         sancov::clear_all();
-        cmp::reset();
+        // Compare-ring reset is skipped when compare guidance is off (Phase-8
+        // coverage-only arm): the events are never read, and skipping the
+        // reset+snapshot removes the collection cost from the arm entirely.
+        // The ring is bounded and self-overwriting, so a skipped reset cannot
+        // grow or corrupt anything.
+        if self.cmp_enabled {
+            cmp::reset();
+        }
         let t0 = SystemTime::now();
         // Clear the per-execution signal vector (NOT execution_ordinal or
         // the schema) BEFORE the target's reset hook, so a target that
@@ -619,9 +646,13 @@ impl Worker {
         //    and are discarded by the next reset). The events stay in the
         //    fixed buffer; they are copied only if this window is pushed as
         //    a discovery (push_discovery) — ordinary executions allocate
-        //    nothing here (Phase 5).
-        let n_events = cmp::snapshot(&mut self.events_buf);
-        let n_events = n_events.min(self.events_buf.len());
+        //    nothing here (Phase 5). Skipped entirely when compare guidance
+        //    is off.
+        let n_events = if self.cmp_enabled {
+            cmp::snapshot(&mut self.events_buf).min(self.events_buf.len())
+        } else {
+            0
+        };
         // 5. Scan (clears). Saturating return is impossible here: the scan
         //    buffer has one slot per counter byte.
         let n = sancov::scan_and_clear(&mut self.scan_buf);
@@ -636,13 +667,17 @@ impl Worker {
         features.dedup();
         // 7. Remember cmp hits for cmp-guided substitution in the NEXT
         //    mutation (bounded). Reads the fixed buffer directly (no copy).
+        //    Skipped when compare guidance is off (defense in depth: even a
+        //    stray cmp-family order cannot substitute without hits).
         self.last_cmp_hits.clear();
-        for e in self.events_buf[..n_events]
-            .iter()
-            .take(MAX_CMP_EVENTS_PER_EXEC)
-        {
-            if let Some(hit) = event_to_hit(e) {
-                self.last_cmp_hits.push(hit);
+        if self.cmp_enabled {
+            for e in self.events_buf[..n_events]
+                .iter()
+                .take(MAX_CMP_EVENTS_PER_EXEC)
+            {
+                if let Some(hit) = event_to_hit(e) {
+                    self.last_cmp_hits.push(hit);
+                }
             }
         }
         Ok(WindowOutcome {

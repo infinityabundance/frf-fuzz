@@ -560,7 +560,7 @@ admission,minimize}`, `observe/{frame,residual,signals,sketch}`,
 `precedent/{mod,model,matching,probe,admission}`, `scheduler/policy`,
 `execute/{finding,worker_process,coordinator}`, `boundary/{witness,
 minimize}`, `tape/{model,replay,revision}`, `gpu/{backend,cpu}`,
-`frf_bridge`, `gemel_bridge`,
+`frf_bridge`, `gemel_bridge`, `experiment/{mod,stats}` (Phase 8),
 `report`, `cli`, `bin/{frf-fuzz,cargo-frf-fuzz}`.
 `dsfb/database_bridge` (Phase 6) is compiled only when the `database`
 feature is enabled; it is the sole frf-fuzz module that links
@@ -578,7 +578,9 @@ checks; gemel boundaries -> their subjects + published-Gid presence;
 revision pairs -> their tapes), and `inspect` decodes all three. The CLI has
 `verify` and `revision replay`; `run` takes `--authority*`,
 `--verify-candidate`, `--verify-claim`, `--question-id`,
-`--fixture-family`, and `--gemel on|off`.
+`--fixture-family`, `--cmp on|off` (Phase 8, default on), and
+`--gemel on|off`. `experiment` (Phase 8) takes a target plus `--arms`,
+`--trials`, `--max-time`/`--max-execs`, `--out`, and `--json` (§22).
 
 ## 19. Performance contract (Phase-1 hot path targets)
 
@@ -602,3 +604,48 @@ FRF evidence, Gemel data, dictionaries. No shell string construction
 (`Command` + argv); every length bounded before allocation; checked
 arithmetic; target timeouts; Unix memory limits; target output never rendered
 uninterpreted. See `THREAT_MODEL.md`.
+
+## 22. Experiment instrument (Phase 8, implemented)
+
+`frf-fuzz experiment` (`src/experiment/{mod,stats}.rs`, coordinator feature)
+runs the ablation ladder of `EXPERIMENT_PROTOCOL.md` §2 as repeated
+independent trials. The design stays two-plane-compliant: every trial is a
+fresh store with a deterministic per-trial seed (splitmix64 over the base
+seed + trial; arms share the seed schedule, so trials differ only in their
+feedback channels), and comparison uses per-trial summaries plus the
+exported raw series — no per-execution observation is elevated to the
+evidence plane.
+
+The arms are frozen deltas over the campaign's three feedback switches:
+`cov` (cmp off, residual off, precedent off) -> `cov+cmp` -> `residual` ->
+`full` (protocol ladder rungs 1-5). The new `--cmp on|off` switch (on
+`run`, default on) gates const-compare dictionary seeding, the
+dictionary/compare mutation families — excluded from the Explore rotation
+via `MutatorId::WITHOUT_CMP_GUIDED` when off — and worker-side cmp-ring
+collection (env `FRF_FUZZ_CMP`). Residual-off campaigns additionally keep
+no morphology objects and count no state features (morphology persistence
+and state-feature insertion are residual-gated in the coordinator admission
+path), so regime/lineage/amplify machinery observes nothing: the `cov` arm
+is semantically coverage-only, not a scheduler-degenerate residual build.
+
+Budgets are mandatory (`--max-time` / `--max-execs`): trials are
+right-censored by design. Raw series export to
+`<out>/<expid>/<ts>/series.csv` (default out root
+`<root>/.frf-fuzz/experiments`) with the protocol §3 metadata in `#`
+comment lines, plus `analysis.txt` and `meta.json` (human and `--json`
+output). The export is the recomputation authority: statistics
+(median/quartiles, Vargha-Delaney A12, Mann-Whitney U two-sided) recompute
+from the raw series, and the CLI never bakes an unsupported claim (I11).
+Censored first-failure trials export `NA` rows and report found/censored
+per arm; arm-pair A12/Mann-Whitney U on censored metrics compares only the
+labeled complete-case subset. `experiment::held_out_split(defect_ids,
+blind_fraction, seed)` derives the deterministic development/blind
+partition for the protocol §4 benchmark-leakage control.
+
+Where it lives: `src/experiment/` (stats dependency-free), the
+`experiment` CLI subcommand, `scripts/phase8_ablation_demo.sh` (golden-demo
+target built on the pinned nightly; asserts the trajectory negative control,
+retention, and export authority), `scripts/baseline_compare.sh`
+(cargo-fuzz/libFuzzer baseline of the same gates; AFL++ recorded skip when
+absent), and `tests/phase8_experiment.rs` (export -> import -> recompute,
+censoring survival, held-out disjointness, identical-arms negative control).

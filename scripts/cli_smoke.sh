@@ -75,5 +75,35 @@ if $FF revision replay 000000000000000000000000000000000000000000000000000000000
 fi
 grep -q 'no object' revision-noargs.out || { echo "FAIL: revision replay error not actionable"; exit 1; }
 
+# Phase-8 CLI surface: the experiment command runs trials over the ablation
+# arms, exports the raw series, and refuses configs that would be dishonest
+# (no censoring budget; per-switch flags that belong to --arms).
+echo "=== 7. phase-8 experiment surface ==="
+if $FF experiment demo --nightly "$NIGHTLY" --bin "$BIN" --workers 2 > exp-nobudget.out 2>&1; then
+  echo "FAIL: experiment without a budget succeeded"
+  exit 1
+fi
+grep -q 'censoring budget' exp-nobudget.out || { echo "FAIL: experiment budget error not actionable"; exit 1; }
+if $FF experiment demo --nightly "$NIGHTLY" --bin "$BIN" --workers 2 --max-time 3 --residual on > exp-switch.out 2>&1; then
+  echo "FAIL: experiment accepted a per-switch flag"
+  exit 1
+fi
+grep -- '--arms' exp-switch.out || { echo "FAIL: experiment switch error not actionable"; exit 1; }
+$FF experiment demo --nightly "$NIGHTLY" --bin "$BIN" \
+  --arms cov,full --trials 1 --max-time 3 --workers 2 --batch-size 500 \
+  --out "$SCRATCH/experiments" --json > experiment.out 2> experiment.err
+EXP_RECORD="$(sed -n 's/.*"record": "\([^\"]*\)".*/\1/p' experiment.out | head -1)"
+EXP_SERIES="$(sed -n 's/.*"series": "\([^\"]*\)".*/\1/p' experiment.out | head -1)"
+test -n "$EXP_RECORD" || { echo "FAIL: experiment record missing"; exit 1; }
+test -f "$EXP_SERIES" || { echo "FAIL: experiment series not exported"; exit 1; }
+test -f "$EXP_RECORD/analysis.txt" || { echo "FAIL: experiment analysis not written"; exit 1; }
+grep -q '"metrics"' experiment.out || { echo "FAIL: experiment JSON malformed"; exit 1; }
+grep -q 'Power caveat' "$EXP_RECORD/analysis.txt" || { echo "FAIL: experiment analysis missing the power caveat"; exit 1; }
+# The exported series has one row per (arm, trial, metric): 2 arms x 1 trial x
+# 15 metrics + the header = 31 non-comment lines.
+NROWS="$(grep -cv '^#' "$EXP_SERIES")"
+[ "$NROWS" = "31" ] || { echo "FAIL: unexpected series size ($NROWS)"; exit 1; }
+echo "experiment smoke: record + export + JSON + caveat verified"
+
 echo
 echo "CLI SMOKE PASS"

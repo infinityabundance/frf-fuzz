@@ -58,6 +58,7 @@ pub fn run(args: &[String]) -> i32 {
         "add" => finish("add", cmd_add(&args[1..])),
         "build" => finish("build", cmd_build(&args[1..])),
         "run" => finish("run", cmd_run(&args[1..])),
+        "experiment" => finish("experiment", cmd_experiment(&args[1..])),
         "replay" => finish("replay", cmd_replay(&args[1..])),
         "tmin" => finish("tmin", cmd_tmin(&args[1..])),
         "cmin" => finish("cmin", cmd_cmin(&args[1..])),
@@ -110,13 +111,18 @@ fn print_usage() {
          \x20 frf-fuzz run <name> [--workers N] [--batch-size N] [--seed <dir>]
          \x20                 [--max-time <secs>] [--max-execs N] [--sanitizer none|address]
          \x20                 [--nightly <tc>] [--memory-limit-mb N] [--root <path>] [--rebuild]
-         \x20                 [--residual on|off] [--precedent on|off]
+         \x20                 [--cmp on|off] [--residual on|off] [--precedent on|off]
          \x20                 [--explore-weight N] [--amplify-weight N]
          \x20                 [--discriminate-weight N] [--falsify-weight N]
          \x20                 [--authority <path>] [--authority-name <n>] [--authority-version <v>]
          \x20                 [--verify-candidate <path>] [--verify-claim]
          \x20                 [--question-id <id>] [--fixture-family <fam>]
          \x20                 [--gemel on|off]
+         \x20 frf-fuzz experiment <name> --arms cov|cov+cmp|residual|full[,..]
+         \x20                 [--trials N] [--max-time <secs>] [--max-execs N]
+         \x20                 [--workers N] [--batch-size N] [--seed <hex>]
+         \x20                 [--seed-dir <dir>] [--sanitizer none|address] [--nightly <tc>]
+         \x20                 [--memory-limit-mb N] [--out <dir>] [--root <path>] [--json]
          \x20 frf-fuzz replay <finding-id> [--root <path>] [--target <name>]
          \x20 frf-fuzz verify <finding-id> --authority <path> [--candidate <path>|--target <name>]
          \x20                 [--authority-name <n>] [--authority-version <v>] [--claim]
@@ -1291,6 +1297,17 @@ fn cmd_run(args: &[String]) -> Result<i32> {
             }
         };
     }
+    if let Some(r) = flag_value(args, "--cmp") {
+        policy.cmp = match r.as_str() {
+            "on" | "1" | "true" => true,
+            "off" | "0" | "false" => false,
+            other => {
+                return Err(crate::error::Error::Other(format!(
+                    "--cmp must be on|off (got `{other}`)"
+                )));
+            }
+        };
+    }
     if let Some(r) = flag_value(args, "--precedent") {
         policy.precedent = match r.as_str() {
             "on" | "1" | "true" => true,
@@ -1357,10 +1374,11 @@ fn cmd_run(args: &[String]) -> Result<i32> {
     crate::execute::coordinator::install_sigint_handler();
     eprintln!("[run] target: {}", cfg.target_bin.display());
     eprintln!(
-        "[run] workers: {} batch: {} seed: {:#x} residual: {} precedent: {}",
+        "[run] workers: {} batch: {} seed: {:#x} cmp: {} residual: {} precedent: {}",
         cfg.policy.workers,
         cfg.policy.batch_size,
         cfg.policy.seed,
+        cfg.policy.cmp,
         cfg.policy.residual,
         cfg.policy.precedent
     );
@@ -1423,8 +1441,283 @@ fn cmd_run(args: &[String]) -> Result<i32> {
     );
     println!("  gemel boundaries: {}", summary.gemel_boundaries);
     println!("  findings: {}", summary.findings);
+    match summary.first_failure_exec {
+        Some(e) => println!("  first failure executions: {e}"),
+        None => println!("  first failure executions: none"),
+    }
+    match summary.first_failure_elapsed {
+        Some(d) => println!("  first failure seconds: {:.3}", d.as_secs_f64()),
+        None => println!("  first failure seconds: none"),
+    }
     println!("  duration: {:.1}s", summary.duration.as_secs_f64());
     Ok(0)
+}
+
+/// `frf-fuzz experiment` (Phase 8): repeated independent trials over the
+/// ablation arms, raw-series export, and median/A12/MWU comparison — the
+/// code-level instrument of docs/EXPERIMENT_PROTOCOL.md §2-§3. The CLI
+/// prints raw facts plus the protocol's power caveat; it never bakes a
+/// statistical conclusion.
+fn cmd_experiment(args: &[String]) -> Result<i32> {
+    let name = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .ok_or_else(|| crate::error::Error::Other("usage: frf-fuzz experiment <name>".into()))?;
+    if flag_value(args, "--bin").is_none() {
+        validate_target_name(name)?;
+    }
+    let root = project_root(args);
+    let store_root = store_root_of(&root);
+    let _s = crate::store::Store::open(store_root.clone())?;
+
+    // The ablation arms (frozen feedback-channel deltas; the feedback
+    // switches themselves are NOT individually settable here — pick arms).
+    let mut arms: Vec<crate::experiment::AblationArm> = Vec::new();
+    match flag_value(args, "--arms") {
+        None => arms = crate::experiment::AblationArm::ALL.to_vec(),
+        Some(list) => {
+            for code in list.split(',') {
+                let a = crate::experiment::AblationArm::parse(code).ok_or_else(|| {
+                    crate::error::Error::Other(format!(
+                        "--arms: unknown arm `{code}` (choose from cov,cov+cmp,residual,full)"
+                    ))
+                })?;
+                if !arms.contains(&a) {
+                    arms.push(a);
+                }
+            }
+        }
+    }
+    if arms.is_empty() {
+        return Err(crate::error::Error::Other(
+            "--arms: at least one arm is required".into(),
+        ));
+    }
+    for f in ["--cmp", "--residual", "--precedent"] {
+        if flag_value(args, f).is_some() {
+            return Err(crate::error::Error::Other(format!(
+                "{f} is not valid for `experiment`; select ablation arms with --arms (the arm \
+                 defines the feedback channels — docs/EXPERIMENT_PROTOCOL.md §2)"
+            )));
+        }
+    }
+
+    // Budget: censoring needs a bound. Mirrors cmd_run's interpretation.
+    let max_time = flag_value(args, "--max-time").map(|s| {
+        let secs: u64 = parse_u64(&s, "--max-time").unwrap_or(0);
+        std::time::Duration::from_secs(secs)
+    });
+    let max_execs = flag_value(args, "--max-execs")
+        .map(|s| parse_u64(&s, "--max-execs"))
+        .transpose()?;
+    if max_time.is_none() && max_execs.is_none() {
+        return Err(crate::error::Error::Other(
+            "experiment requires --max-time <secs> or --max-execs N (a censoring budget; \
+             trials without a failure in budget are recorded as censored, never dropped)"
+                .into(),
+        ));
+    }
+
+    let trials: u32 = match flag_value(args, "--trials") {
+        None => 3,
+        Some(v) => v.parse().map_err(|_| {
+            crate::error::Error::Other("--trials must be a positive integer".into())
+        })?,
+    };
+    if trials == 0 || trials > crate::experiment::MAX_TRIALS {
+        return Err(crate::error::Error::Other(format!(
+            "--trials must be in 1..={}",
+            crate::experiment::MAX_TRIALS
+        )));
+    }
+
+    let bin = resolve_target_bin(name, args)?;
+    let nightly = nightly_from(args);
+    let sanitizer = sanitizer_from(args)?;
+    let (release, llvm) = toolchain_identity(&nightly)?;
+
+    let mut policy = crate::scheduler::policy::SchedulePolicy::default();
+    if let Some(w) = flag_value(args, "--workers") {
+        policy.workers = w.parse().map_err(|_| {
+            crate::error::Error::Other("--workers must be a positive integer".into())
+        })?;
+    }
+    if let Some(b) = flag_value(args, "--batch-size") {
+        policy.batch_size = b.parse().map_err(|_| {
+            crate::error::Error::Other("--batch-size must be an integer >= 1".into())
+        })?;
+        if policy.batch_size == 0
+            || policy.batch_size > crate::scheduler::work_order::MAX_DISCOVERIES_PER_RESULT as u64
+        {
+            return Err(crate::error::Error::Other(format!(
+                "--batch-size must be in 1..={}",
+                crate::scheduler::work_order::MAX_DISCOVERIES_PER_RESULT
+            )));
+        }
+    }
+    let base_seed = match flag_value(args, "--seed") {
+        None => 0xC0FFEE,
+        Some(v) => parse_u64(&v, "--seed")?,
+    };
+    if let Some(w) = flag_value(args, "--explore-weight") {
+        policy.class_weights[0] = parse_u64(&w, "--explore-weight")?;
+    }
+    if let Some(w) = flag_value(args, "--amplify-weight") {
+        policy.class_weights[1] = parse_u64(&w, "--amplify-weight")?;
+    }
+    if let Some(w) = flag_value(args, "--discriminate-weight") {
+        policy.class_weights[2] = parse_u64(&w, "--discriminate-weight")?;
+    }
+    if let Some(w) = flag_value(args, "--falsify-weight") {
+        policy.class_weights[3] = parse_u64(&w, "--falsify-weight")?;
+    }
+    let memory_limit_mb = flag_value(args, "--memory-limit-mb")
+        .map(|s| parse_u64(&s, "--memory-limit-mb"))
+        .transpose()?
+        .unwrap_or(0);
+    let seed_dir = flag_value(args, "--seed-dir").map(PathBuf::from);
+    let out_root = flag_value(args, "--out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| store_root.join("experiments"));
+    crate::store::ensure_dir(&out_root)?;
+
+    let spec = crate::experiment::ExperimentSpec {
+        target_name: name.clone(),
+        target_bin: bin,
+        arms,
+        trials,
+        base_policy: policy,
+        base_seed,
+        seed_dir,
+        max_time: max_time.unwrap_or_else(|| std::time::Duration::from_secs(0)),
+        max_execs,
+        sanitizer,
+        memory_limit_mb,
+        initial_dictionary: Vec::new(), // ablations run dictionary-free by design
+        rustc_release: release,
+        llvm_version: llvm,
+        instrument_flags: build_flags(sanitizer)
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect(),
+        nightly,
+        out_root,
+    };
+    if spec.max_time.is_zero() && spec.max_execs.is_none() {
+        return Err(crate::error::Error::Other(
+            "experiment requires --max-time <secs> > 0 or --max-execs N".into(),
+        ));
+    }
+    crate::execute::coordinator::install_sigint_handler();
+    let record = crate::experiment::run_experiment(&spec)?;
+    if has_flag(args, "--json") {
+        println!("{}", render_experiment_json(&record));
+    } else {
+        print!("{}", record.analysis_text);
+        println!("experiment record: {}", record.dir.display());
+        println!("raw series: {}", record.series_path.display());
+    }
+    Ok(0)
+}
+
+/// Minimal structured JSON for an experiment record (no serde dependency; a
+/// flat documented shape: meta plus per-metric arm medians and comparisons).
+fn render_experiment_json(record: &crate::experiment::ExperimentRecord) -> String {
+    let mut out = String::from("{\n");
+    let esc = |s: &str| -> String {
+        let mut o = String::with_capacity(s.len() + 2);
+        o.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => o.push_str("\\\""),
+                '\\' => o.push_str("\\\\"),
+                '\n' => o.push_str("\\n"),
+                c => o.push(c),
+            }
+        }
+        o.push('"');
+        o
+    };
+    out.push_str(&format!(
+        "  {}: {},\n",
+        esc("record"),
+        esc(&record.dir.display().to_string())
+    ));
+    out.push_str(&format!(
+        "  {}: {},\n",
+        esc("series"),
+        esc(&record.series_path.display().to_string())
+    ));
+    out.push_str(&format!("  {}: {},\n", esc("trials"), record.series.len()));
+    out.push_str(&format!("  {}: [\n", esc("metrics")));
+    for (mi, a) in record.analysis.iter().enumerate() {
+        out.push_str("    {\n");
+        out.push_str(&format!(
+            "      {}: {},\n",
+            esc("metric"),
+            esc(a.metric.code())
+        ));
+        out.push_str(&format!("      {}: {{\n", esc("arms")));
+        for (arm, st) in &a.by_arm {
+            let med = match st.median {
+                Some(v) => format!("{v:.6}"),
+                None => "null".to_string(),
+            };
+            let q1 = match st.q1 {
+                Some(v) => format!("{v:.6}"),
+                None => "null".to_string(),
+            };
+            let q3 = match st.q3 {
+                Some(v) => format!("{v:.6}"),
+                None => "null".to_string(),
+            };
+            out.push_str(&format!(
+                "        {}: {{\"n\":{}, \"found\":{}, \"censored\":{}, \"median\":{}, \"q1\":{}, \"q3\":{}}},\n",
+                esc(arm.code()),
+                st.n,
+                st.found,
+                st.censored,
+                med,
+                q1,
+                q3
+            ));
+        }
+        out.push_str("      },\n");
+        out.push_str(&format!("      {}: [\n", esc("comparisons")));
+        for c in &a.comparisons {
+            let a12 = match c.a12 {
+                Some(v) => format!("{v:.6}"),
+                None => "null".to_string(),
+            };
+            let p = match c.mwu {
+                Some(m) => format!("{:.6}", m.p_two_sided),
+                None => "null".to_string(),
+            };
+            let z = match c.mwu {
+                Some(m) => format!("{:.6}", m.z),
+                None => "null".to_string(),
+            };
+            out.push_str(&format!(
+                "        {{\"left\":{}, \"right\":{}, \"a12\":{}, \"mwu_z\":{}, \"mwu_p\":{}, \"n_pairs\":{}, \"complete_case\":{}}},\n",
+                esc(c.left.code()),
+                esc(c.right.code()),
+                a12,
+                z,
+                p,
+                c.n_pairs,
+                c.complete_case
+            ));
+        }
+        out.push_str("      ]\n");
+        let comma = if mi + 1 < record.analysis.len() {
+            ","
+        } else {
+            ""
+        };
+        out.push_str(&format!("    }}{comma}\n"));
+    }
+    out.push_str("  ]\n}\n");
+    out
 }
 
 fn parse_u64(s: &str, what: &str) -> Result<u64> {

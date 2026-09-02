@@ -153,6 +153,11 @@ pub struct CampaignSummary {
     pub features: usize,
     /// Findings recorded.
     pub findings: u64,
+    /// Executions attempted before the first failure finding (crash or
+    /// timeout) was recorded, if any occurred.
+    pub first_failure_exec: Option<u64>,
+    /// Wall time from campaign start to the first failure finding.
+    pub first_failure_elapsed: Option<Duration>,
     /// Duration.
     pub duration: Duration,
     /// Whether the campaign ended gracefully (interrupt/time/max-execs).
@@ -279,6 +284,11 @@ struct CampaignState {
     frf_failed: u64,
     /// Local Gemel boundary records written.
     gemel_boundaries: u64,
+    /// Executions attempted when the FIRST failure finding was recorded
+    /// (crash or timeout; None = no failure occurred).
+    first_failure_exec: Option<u64>,
+    /// Wall time from campaign start to the first failure finding.
+    first_failure_elapsed: Option<std::time::Duration>,
     /// Inputs already court-verified THIS campaign (BLAKE3 over the input
     /// bytes). FRF courts are expensive (they hash the full candidate and
     /// run both sides); a crash flood of identical inputs must not re-run
@@ -380,6 +390,8 @@ impl CampaignState {
             frf_verified: 0,
             frf_failed: 0,
             gemel_boundaries: 0,
+            first_failure_exec: None,
+            first_failure_elapsed: None,
             verified_inputs: std::collections::BTreeSet::new(),
             schema_ref: None,
             schema: None,
@@ -891,6 +903,7 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
                         break 'poll;
                     }
                     Some(WorkerEvent::Eof) => {
+                        let findings_before = findings;
                         handle_worker_death(
                             cfg,
                             &store,
@@ -903,6 +916,10 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
                             &mut index,
                             &mut state,
                         )?;
+                        if findings > findings_before && state.first_failure_exec.is_none() {
+                            state.first_failure_exec = Some(executions);
+                            state.first_failure_elapsed = Some(start.elapsed());
+                        }
                         break 'poll;
                     }
                     None => {}
@@ -991,6 +1008,8 @@ pub fn run_campaign(cfg: &CampaignConfig) -> Result<CampaignSummary> {
         corpus_entries: index.len(),
         features: index.feature_count(),
         findings,
+        first_failure_exec: state.first_failure_exec,
+        first_failure_elapsed: state.first_failure_elapsed,
         duration: start.elapsed(),
         graceful,
         state_features: state.state_features.len(),
@@ -1220,20 +1239,24 @@ fn process_result(
     let mut admitted = 0u64;
     let mut new_global: Vec<u64> = Vec::new();
 
-    // Dictionary discovery: const-cmp operands become tokens.
-    for d in &result.discoveries {
-        for e in &d.cmp_events {
-            if e.kind == 2 && e.width >= 1 && e.width <= 8 {
-                for val in [e.a, e.b] {
-                    let bytes = value_bytes(val, e.width);
-                    if is_interesting_token(&bytes) && dict_consts.insert(bytes.clone()) {
-                        *dict_const_count += 1;
+    // Dictionary discovery: const-cmp operands become tokens. Gated on the
+    // compare channel (Phase 8): with `cmp = off` the campaign is genuinely
+    // coverage-only and no compare observation may influence later mutations.
+    if state.cfg.policy.cmp {
+        for d in &result.discoveries {
+            for e in &d.cmp_events {
+                if e.kind == 2 && e.width >= 1 && e.width <= 8 {
+                    for val in [e.a, e.b] {
+                        let bytes = value_bytes(val, e.width);
+                        if is_interesting_token(&bytes) && dict_consts.insert(bytes.clone()) {
+                            *dict_const_count += 1;
+                        }
                     }
                 }
             }
-        }
-        if *dict_const_count > work_order::MAX_DICT_ENTRIES {
-            break;
+            if *dict_const_count > work_order::MAX_DICT_ENTRIES {
+                break;
+            }
         }
     }
     // Materialize new const tokens into the dictionary (bounded).
@@ -1354,15 +1377,33 @@ fn process_result(
             continue; // already known
         }
         // Commit the lineage accumulator clone (the entry is admitted).
-        let (morph, morph_id) = commit_morphology(state, index, pend, &edge, d)?;
-        if let Some(_mid) = morph_id {
-            let payload = morph.encode()?;
-            store.put(Family::MorphologySignature, &payload)?;
-            state.morph_identities.insert(morph.structural_identity());
-        }
-        // Insert the new state features (admission commits them).
-        for (s, b) in state_buckets(&d.signals) {
-            state.state_features.insert((s, b));
+        // Under the residual switch the committed morphology is persisted as
+        // a signature object, counted, and linked from the corpus meta; a
+        // residual-off campaign keeps NO structural memory (no lineage
+        // accumulator, no signature objects, no state-feature buckets — the
+        // Phase-8 ablation semantics: coverage-only corpora must show zero
+        // morphologies/state-features/regimes). The entry is still admitted
+        // by coverage below and its signals remain in the meta (they are
+        // needed for a later residual-on resume to re-derive everything).
+        let residual_on = state.cfg.policy.residual;
+        let (morph, morph_id) = if residual_on {
+            commit_morphology(state, index, pend, &edge, d)?
+        } else {
+            (
+                MorphologySignature::trivial(pend.parent_generation + 1),
+                None,
+            )
+        };
+        if residual_on {
+            if let Some(_mid) = morph_id {
+                let payload = morph.encode()?;
+                store.put(Family::MorphologySignature, &payload)?;
+                state.morph_identities.insert(morph.structural_identity());
+            }
+            // Insert the new state features (admission commits them).
+            for (s, b) in state_buckets(&d.signals) {
+                state.state_features.insert((s, b));
+            }
         }
         let generation = pend.parent_generation + 1;
         let mut feat = d.features.clone();
@@ -1391,17 +1432,20 @@ fn process_result(
         }
 
         // ---- lineage / regime / amplify / DSFB updates ----
+        // All of this is residual-channel memory: lineage accumulators,
+        // regime observers, structured-signature history, amplify/precedent
+        // queues. A residual-off campaign skips it entirely (the arm keeps
+        // no structural state — Phase-8 ablation semantics).
         let root = state
             .root_of(index, &pend.parent_id)
             .unwrap_or(pend.parent_id);
         let mutator = d.coordinate.mutator_id.id();
         let key = (root, mutator);
-        let residual_on = state.cfg.policy.residual;
         let precedent_on = state.cfg.policy.precedent;
         let regime_cfg = state.regime_cfg;
         // Outputs gathered while the lineage entry is mutably borrowed.
         let mut closed_regime: Vec<(u16, RegimeEpisode)> = Vec::new();
-        {
+        if residual_on {
             let ls = state.lineages.entry(key).or_insert_with(|| {
                 let mut ls = LineageState::new();
                 if let Some(root_meta) = index.meta(&root) {

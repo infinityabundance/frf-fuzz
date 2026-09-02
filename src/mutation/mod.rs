@@ -90,6 +90,38 @@ impl MutatorId {
         MutatorId::InfluenceRegionMutation,
     ];
 
+    /// The mutator families available when compare guidance is OFF (Phase-8
+    /// coverage-only ablation arm): the dictionary and compare-substitution
+    /// families are excluded because they exist to write observed compare
+    /// operands — with no cmp channel there must be no way for them to fire.
+    /// Kept in the same relative ID order so Explore rotation is a pure
+    /// subset of [`MutatorId::ALL`].
+    pub const WITHOUT_CMP_GUIDED: [MutatorId; 13] = [
+        MutatorId::BitFlip,
+        MutatorId::ByteFlip,
+        MutatorId::MultiByteFlips,
+        MutatorId::IntegerAddSub,
+        MutatorId::IntegerBoundary,
+        MutatorId::InterestingInteger,
+        MutatorId::ByteInsert,
+        MutatorId::ByteDelete,
+        MutatorId::BlockDuplicate,
+        MutatorId::BlockDelete,
+        MutatorId::BlockOverwrite,
+        MutatorId::Splice,
+        MutatorId::InfluenceRegionMutation,
+    ];
+
+    /// The active family table for a policy: all families when compare
+    /// guidance is enabled, the cmp-free subset otherwise.
+    pub const fn table(cmp: bool) -> &'static [MutatorId] {
+        if cmp {
+            &MutatorId::ALL
+        } else {
+            &MutatorId::WITHOUT_CMP_GUIDED
+        }
+    }
+
     /// The stable numeric ID.
     pub const fn id(self) -> u16 {
         self as u16
@@ -296,6 +328,48 @@ mod tests {
         for (i, m) in MutatorId::ALL.iter().enumerate() {
             assert_eq!(m.id(), expect[i].0);
         }
+    }
+
+    #[test]
+    fn cmp_free_table_is_a_stable_subset() {
+        // Lock the cmp-free family table (Phase-8 coverage-only arm): 13
+        // entries, ids {1..=12, 16}, excluding exactly the dictionary-insert/
+        // dictionary-overwrite/compare-operand-substitution families.
+        let expect: &[(u16, &str)] = &[
+            (1, "bit-flip"),
+            (2, "byte-flip"),
+            (3, "multi-byte-flips"),
+            (4, "integer-add-sub"),
+            (5, "integer-boundary"),
+            (6, "interesting-integer"),
+            (7, "byte-insert"),
+            (8, "byte-delete"),
+            (9, "block-duplicate"),
+            (10, "block-delete"),
+            (11, "block-overwrite"),
+            (12, "splice"),
+            (16, "influence-region-mutation"),
+        ];
+        assert_eq!(MutatorId::WITHOUT_CMP_GUIDED.len(), expect.len());
+        for (i, m) in MutatorId::WITHOUT_CMP_GUIDED.iter().enumerate() {
+            assert_eq!(m.id(), expect[i].0);
+        }
+        // Every cmp-free entry appears in ALL at the same position (pure
+        // subset, same relative order).
+        let mut j = 0usize;
+        for (i, m) in MutatorId::ALL.iter().enumerate() {
+            if MutatorId::WITHOUT_CMP_GUIDED.get(j) == Some(m) {
+                j += 1;
+            }
+            assert_eq!(m.id(), i as u16 + 1, "ALL must stay 1..=16");
+        }
+        assert_eq!(j, MutatorId::WITHOUT_CMP_GUIDED.len());
+        // table() dispatches on the switch.
+        assert_eq!(MutatorId::table(true).len(), MutatorId::ALL.len());
+        assert_eq!(
+            MutatorId::table(false).len(),
+            MutatorId::WITHOUT_CMP_GUIDED.len()
+        );
     }
 
     #[test]

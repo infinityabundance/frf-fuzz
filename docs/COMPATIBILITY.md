@@ -350,3 +350,15 @@ the single-threaded worker discipline (portable), not on x86 atomicity
   pins SHA-256 fingerprints). frf-fuzz asserts reproducibility of its own
   analyses on the same build; cross-toolchain float-codegen stability is
   the pinned crate's concern and its pinned version `=0.1.1` protects it.
+
+## 12. Phase-8 integration notes (experiment harness)
+
+* `frf-fuzz experiment` (Phase 8) requires an instrumented target built
+  with the pinned nightly, exactly like `run`; each trial executes that
+  instrumented binary under the same flag set. `scripts/phase8_ablation_demo.sh`
+  performs the nightly build of the golden-demo target before running its
+  trials.
+* No new toolchain or dependency requirements in Phase 8: the experiment
+  instrument compiles with the same stable-Rust 1.98 coordinator and the
+  existing feature set; its statistics and JSON/CSV writers are
+  dependency-free (`DEPENDENCIES.md`).
