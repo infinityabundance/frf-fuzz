@@ -7,6 +7,8 @@
 //! corpus + observation + dsfb + boundary + tape); the process-level worker
 //! paths are covered by `scripts/golden_demo.sh`.
 
+#![cfg(feature = "coordinator")]
+
 use frf_fuzz::canon::Family;
 use frf_fuzz::corpus::admission::{decide, ResidualInput};
 use frf_fuzz::corpus::entry::{self, AdmissionReason, CorpusMeta};

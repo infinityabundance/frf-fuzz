@@ -11,6 +11,8 @@
 //!
 //! Requires the `coordinator` feature (the default build).
 
+#![cfg(feature = "coordinator")]
+
 use frf_fuzz::dsfb::debug_bridge::{AxisVerdict, BridgeConfig, DriftDir, LineageSubstrate};
 use frf_fuzz::dsfb::fuzz_bank::{classify_evidence, role_of, AxisRole, BankEvidence, FuzzMotif};
 use frf_fuzz::dsfb::morphology::{LineageAccumulator, MorphologySignature};
